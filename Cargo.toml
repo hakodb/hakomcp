@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Thin MCP server for the HakoDB embedded document engine"
 license = "MIT"
+repository = "https://github.com/hakodb/hakomcp"
+homepage = "https://github.com/hakodb/hakomcp"
+readme = "README.md"
+keywords = ["mcp", "hakodb", "database", "embedded", "vector"]
+categories = ["database", "command-line-utilities"]
 
 [dependencies]
 # Core engine only: the MCP server embeds one local database and does not
