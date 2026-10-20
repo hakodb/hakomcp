@@ -70,7 +70,7 @@ Example MCP client entry:
 }
 ```
 
-`vectors` entries override same-named `doc` fields. Create the vector index before or after writing; the engine backfills existing documents on index creation.
+`vectors` entries override same-named `doc` fields. Create the vector index before or after writing; the engine backfills existing documents on index creation. `find_near` returns nearest-first hits with a `score` that is the metric distance (lower is closer).
 
 ### Filters
 
