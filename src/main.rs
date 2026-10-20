@@ -215,7 +215,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_near",
-                    "description": "Exact KNN search over a vector index. `vector` is the query embedding and `k` is the hit count.",
+                    "description": "Exact KNN search over a vector index. `vector` is the query embedding and `k` is the hit count. Hits are nearest-first; `score` is the metric distance (lower is closer).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
