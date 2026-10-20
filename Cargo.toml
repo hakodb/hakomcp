@@ -1,0 +1,13 @@
+[package]
+name = "hakomcp"
+version = "0.1.0"
+edition = "2021"
+description = "Thin MCP server for the HakoDB embedded document engine"
+license = "MIT"
+
+[dependencies]
+# Core engine only: the MCP server embeds one local database and does not
+# need the mesh/cloud transport planes.
+hakodb = { version = "0.16", default-features = false }
+serde_json = "1"
+anyhow = "1"

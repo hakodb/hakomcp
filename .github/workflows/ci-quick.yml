@@ -1,0 +1,28 @@
+# Quick gate for branch protection (required check on main).
+# Answers one question fast: does it (incl. tests) still compile locked?
+# Cache makes PR runs incremental. Full matrices stay in release workflows.
+
+name: ci-quick
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: quick-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check (locked, incl. tests)
+        run: cargo check --tests
