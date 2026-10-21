@@ -92,9 +92,10 @@ fn stdio_handshake_and_read_profile() {
         .iter()
         .map(|tool| tool["name"].as_str().expect("name"))
         .collect();
-    assert!(names.contains(&"get"));
-    assert!(!names.contains(&"put"));
-    assert!(!names.contains(&"create_index"));
+    assert!(names.contains(&"document_get"));
+    assert!(names.contains(&"collection_list"));
+    assert!(!names.contains(&"document_put"));
+    assert!(!names.contains(&"index_create"));
 
     client.send(json!({
         "jsonrpc": "2.0",
