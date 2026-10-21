@@ -7,11 +7,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use hakodb::config::HakoConfig;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
-use hakodb::engine::Hako;
+use hakodb::engine::engine::CollectionStats;
+use hakodb::engine::{BatchMutation, Hako};
+use hakodb::index::composite::definition::SortDirection;
 use hakodb::index::traverse::{TraverseDir, TraverseSpec};
 use hakodb::index::vector::{decode_f32s, distance, encode_f32s, Metric};
-use hakodb::query::filter::Operator;
-use hakodb::query::query::Query;
+use hakodb::query::filter::{Filter, Operator};
+use hakodb::query::query::{AggregateOp, Query};
+use hakodb::schema::CollectionSchema;
 use serde_json::{json, Value as JsonValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -90,8 +93,21 @@ impl Profile {
 
     fn allows_tool(self, name: &str) -> bool {
         match name {
-            "get" | "query" | "find_near" | "find_paths" | "server_status" => true,
-            "put" | "create_index" => matches!(self, Self::Data | Self::Sync | Self::Admin),
+            "document_get"
+            | "query"
+            | "find_near"
+            | "find_paths"
+            | "collection_list"
+            | "collection_describe"
+            | "collection_stats"
+            | "aggregate"
+            | "explain"
+            | "index_list"
+            | "server_status" => true,
+            "document_put" | "document_patch" | "document_delete" | "document_batch"
+            | "index_create" | "schema_set" | "schema_clear" => {
+                matches!(self, Self::Data | Self::Sync | Self::Admin)
+            }
             _ => false,
         }
     }
@@ -295,8 +311,8 @@ impl Server {
     fn tools_list(&self) -> JsonValue {
         let mut tools = vec![
             json!({
-                "name": "get",
-                "description": "Read one document by collection and id.",
+                "name": "document_get",
+                "description": "Read one document by collection and id. Legacy alias: `get`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -307,8 +323,8 @@ impl Server {
                 }
             }),
             json!({
-                "name": "put",
-                "description": "Insert or replace a document. Fields hold ordinary JSON values; `vectors` holds vector-index fields (LE f32 arrays) and overrides same-named doc fields.",
+                "name": "document_put",
+                "description": "Insert or replace a document. Fields hold ordinary JSON values; `vectors` holds vector-index fields (LE f32 arrays) and overrides same-named doc fields. Legacy alias: `put`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -340,6 +356,335 @@ impl Server {
                         "any": {
                             "type": "array",
                             "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "elem_match": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "field": { "type": "string" },
+                                    "filters": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/$defs/filter" }
+                                    }
+                                },
+                                "required": ["field", "filters"]
+                            }
+                        },
+                        "order_by": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "field": { "type": "string" },
+                                    "direction": { "type": "string", "enum": ["asc", "desc"] }
+                                },
+                                "required": ["field"]
+                            }
+                        },
+                        "limit": { "type": "integer", "minimum": 0 },
+                        "offset": { "type": "integer", "minimum": 0 },
+                        "cursor": { "type": "string" },
+                        "select": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["collection"],
+                    "$defs": {
+                        "filter": {
+                            "type": "object",
+                            "properties": {
+                                "field": { "type": "string" },
+                                "op": {
+                                    "type": "string",
+                                    "enum": [
+                                        "eq", "ne", "gt", "gte", "lt", "lte",
+                                        "match", "match_prefix", "contains",
+                                        "starts_with", "in", "array_contains",
+                                        "array_contains_any", "array_all_eq", "not_in"
+                                    ]
+                                },
+                                "value": {}
+                            },
+                            "required": ["field", "op", "value"]
+                        }
+                    }
+                }
+            }),
+            json!({
+                "name": "index_create",
+                "description": "Create an index. `kind` is secondary, fts, vector, composite, edge, or traverse. Legacy alias: `create_index`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "field": { "type": "string" },
+                        "kind": { "type": "string", "enum": ["secondary", "fts", "vector", "composite", "edge", "traverse"] },
+                        "dim": { "type": "integer", "minimum": 1 },
+                        "metric": { "type": "string", "enum": ["cosine", "l2"] },
+                        "fields": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "field": { "type": "string" },
+                                    "direction": { "type": "string", "enum": ["asc", "desc"] }
+                                },
+                                "required": ["field"]
+                            }
+                        },
+                        "unique": { "type": "boolean" },
+                        "sparse": { "type": "boolean" }
+                    },
+                    "required": ["collection", "kind"]
+                }
+            }),
+            json!({
+                "name": "find_near",
+                "description": "Exact KNN search over a vector index. `vector` is the query embedding and `k` is the hit count. Hits are nearest-first; `score` is the metric distance (lower is closer).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "field": { "type": "string" },
+                        "vector": {
+                            "type": "array",
+                            "items": { "type": "number" }
+                        },
+                        "k": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["collection", "field", "vector"]
+                }
+            }),
+            json!({
+                "name": "find_paths",
+                "description": "Walk references from one document. Incoming walks need a traverse or edge index; `via_edge` and `weight_field` use an edge collection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "id": { "type": "string" },
+                        "direction": { "type": "string", "enum": ["out", "in", "both"] },
+                        "edge_field": { "type": "string" },
+                        "max_depth": { "type": "integer", "minimum": 1 },
+                        "limit": { "type": "integer", "minimum": 1 },
+                        "via_edge": { "type": "string" },
+                        "weight_field": { "type": "string" }
+                    },
+                    "required": ["collection", "id"]
+                }
+            }),
+            json!({
+                "name": "collection_list",
+                "description": "List visible collections with document counts.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "collection_describe",
+                "description": "Return one collection's schema, indexes, statistics, and residency.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" }
+                    },
+                    "required": ["collection"]
+                }
+            }),
+            json!({
+                "name": "collection_stats",
+                "description": "Return size, WAL, blob, tombstone, and residency statistics for one collection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" }
+                    },
+                    "required": ["collection"]
+                }
+            }),
+            json!({
+                "name": "schema_set",
+                "description": "Declare or replace a collection schema. Fields are top-level: name, kind, required, default.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "fields": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string" },
+                                            "kind": { "type": "string" },
+                                            "required": { "type": "boolean" },
+                                            "default": {}
+                                        },
+                                        "required": ["name", "kind"]
+                                    }
+                                }
+                            },
+                            "required": ["fields"]
+                        }
+                    },
+                    "required": ["collection", "schema"]
+                }
+            }),
+            json!({
+                "name": "schema_clear",
+                "description": "Remove a collection schema. Existing documents are unaffected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" }
+                    },
+                    "required": ["collection"]
+                }
+            }),
+            json!({
+                "name": "document_patch",
+                "description": "Patch named fields on one document.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "id": { "type": "string" },
+                        "updates": { "type": "object" }
+                    },
+                    "required": ["collection", "id", "updates"]
+                }
+            }),
+            json!({
+                "name": "document_delete",
+                "description": "Delete one document by collection and id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "id": { "type": "string" }
+                    },
+                    "required": ["collection", "id"]
+                }
+            }),
+            json!({
+                "name": "document_batch",
+                "description": "Apply an atomic batch of put, patch, and delete mutations.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "mutations": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "op": { "type": "string", "enum": ["put", "patch", "delete"] },
+                                    "collection": { "type": "string" },
+                                    "id": { "type": "string" },
+                                    "doc": { "type": "object" },
+                                    "vectors": {
+                                        "type": "object",
+                                        "additionalProperties": {
+                                            "type": "array",
+                                            "items": { "type": "number" }
+                                        }
+                                    },
+                                    "updates": { "type": "object" }
+                                },
+                                "required": ["op", "collection"]
+                            }
+                        }
+                    },
+                    "required": ["mutations"]
+                }
+            }),
+            json!({
+                "name": "aggregate",
+                "description": "Run count, sum, or avg over a collection query.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "filters": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "any": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "elem_match": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "field": { "type": "string" },
+                                    "filters": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/$defs/filter" }
+                                    }
+                                },
+                                "required": ["field", "filters"]
+                            }
+                        },
+                        "op": { "type": "string", "enum": ["count", "sum", "avg"] },
+                        "field": { "type": "string" }
+                    },
+                    "required": ["collection", "op"],
+                    "$defs": {
+                        "filter": {
+                            "type": "object",
+                            "properties": {
+                                "field": { "type": "string" },
+                                "op": {
+                                    "type": "string",
+                                    "enum": [
+                                        "eq", "ne", "gt", "gte", "lt", "lte",
+                                        "match", "match_prefix", "contains",
+                                        "starts_with", "in", "array_contains",
+                                        "array_contains_any", "array_all_eq", "not_in"
+                                    ]
+                                },
+                                "value": {}
+                            },
+                            "required": ["field", "op", "value"]
+                        }
+                    }
+                }
+            }),
+            json!({
+                "name": "explain",
+                "description": "Return the engine query plan and the indexes available for a query.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "filters": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "any": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "elem_match": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "field": { "type": "string" },
+                                    "filters": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/$defs/filter" }
+                                    }
+                                },
+                                "required": ["field", "filters"]
+                            }
                         },
                         "order_by": {
                             "type": "array",
@@ -382,53 +727,14 @@ impl Server {
                 }
             }),
             json!({
-                "name": "create_index",
-                "description": "Create a secondary, full-text, or vector index. Vector indexes also need `dim`; `metric` defaults to cosine.",
+                "name": "index_list",
+                "description": "List simple, secondary, FTS, composite, vector, and traverse indexes.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "collection": { "type": "string" },
-                        "field": { "type": "string" },
-                        "kind": { "type": "string", "enum": ["secondary", "fts", "vector"] },
-                        "dim": { "type": "integer", "minimum": 1 },
-                        "metric": { "type": "string", "enum": ["cosine", "l2"] }
+                        "collection": { "type": "string" }
                     },
-                    "required": ["collection", "field", "kind"]
-                }
-            }),
-            json!({
-                "name": "find_near",
-                "description": "Exact KNN search over a vector index. `vector` is the query embedding and `k` is the hit count. Hits are nearest-first; `score` is the metric distance (lower is closer).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "collection": { "type": "string" },
-                        "field": { "type": "string" },
-                        "vector": {
-                            "type": "array",
-                            "items": { "type": "number" }
-                        },
-                        "k": { "type": "integer", "minimum": 1 }
-                    },
-                    "required": ["collection", "field", "vector"]
-                }
-            }),
-            json!({
-                "name": "find_paths",
-                "description": "Walk references from one document. Incoming walks need a traverse or edge index; `via_edge` and `weight_field` use an edge collection.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "collection": { "type": "string" },
-                        "id": { "type": "string" },
-                        "direction": { "type": "string", "enum": ["out", "in", "both"] },
-                        "edge_field": { "type": "string" },
-                        "max_depth": { "type": "integer", "minimum": 1 },
-                        "limit": { "type": "integer", "minimum": 1 },
-                        "via_edge": { "type": "string" },
-                        "weight_field": { "type": "string" }
-                    },
-                    "required": ["collection", "id"]
+                    "additionalProperties": false
                 }
             }),
             json!({
@@ -451,21 +757,39 @@ impl Server {
     }
 
     fn tools_call(&self, params: &JsonValue) -> RpcResult<JsonValue> {
-        let name = params
+        let requested = params
             .get("name")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| RpcError::invalid("missing tool name"))?;
+        let name = canonical_tool_name(requested);
 
         let known = matches!(
             name,
-            "get" | "put" | "query" | "create_index" | "find_near" | "find_paths" | "server_status"
+            "document_get"
+                | "document_put"
+                | "document_patch"
+                | "document_delete"
+                | "document_batch"
+                | "query"
+                | "aggregate"
+                | "explain"
+                | "index_create"
+                | "index_list"
+                | "collection_list"
+                | "collection_describe"
+                | "collection_stats"
+                | "schema_set"
+                | "schema_clear"
+                | "find_near"
+                | "find_paths"
+                | "server_status"
         );
         if !known {
-            return Err(RpcError::invalid(format!("unknown tool: {name}")));
+            return Err(RpcError::invalid(format!("unknown tool: {requested}")));
         }
         if !self.config.profile.allows_tool(name) {
             return Err(RpcError::invalid(format!(
-                "tool `{name}` is not available in profile `{}`",
+                "tool `{requested}` is not available in profile `{}`",
                 self.config.profile.as_str()
             )));
         }
@@ -476,10 +800,21 @@ impl Server {
             .unwrap_or_else(|| json!({}));
 
         let result = match name {
-            "get" => self.tool_get(&args),
-            "put" => self.tool_put(&args),
+            "document_get" => self.tool_get(&args),
+            "document_put" => self.tool_put(&args),
+            "document_patch" => self.tool_patch(&args),
+            "document_delete" => self.tool_delete(&args),
+            "document_batch" => self.tool_batch(&args),
             "query" => self.tool_query(&args),
-            "create_index" => self.tool_create_index(&args),
+            "aggregate" => self.tool_aggregate(&args),
+            "explain" => self.tool_explain(&args),
+            "index_create" => self.tool_create_index(&args),
+            "index_list" => self.tool_index_list(&args),
+            "collection_list" => self.tool_collection_list(),
+            "collection_describe" => self.tool_collection_describe(&args),
+            "collection_stats" => self.tool_collection_stats(&args),
+            "schema_set" => self.tool_schema_set(&args),
+            "schema_clear" => self.tool_schema_clear(&args),
             "find_near" => self.tool_find_near(&args),
             "find_paths" => self.tool_find_paths(&args),
             "server_status" => self.tool_server_status(),
@@ -516,26 +851,7 @@ impl Server {
     fn tool_put(&self, args: &JsonValue) -> Result<JsonValue> {
         let collection = required_str(args, "collection")?;
         self.ensure_collection(collection)?;
-        let fields = args
-            .get("doc")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| anyhow!("`doc` must be an object"))?;
-
-        let mut doc = HakoDoc::default();
-        for (field, value) in fields {
-            let value = Value::from_json(value.clone()).map_err(|error| anyhow!(error))?;
-            doc.insert(field.clone(), value);
-        }
-        if let Some(vectors) = args.get("vectors") {
-            let vectors = vectors
-                .as_object()
-                .ok_or_else(|| anyhow!("`vectors` must be an object"))?;
-            for (field, vector) in vectors {
-                let vector = json_to_f32s(vector)?;
-                doc.insert(field.clone(), Value::Binary(encode_f32s(&vector)));
-            }
-        }
-
+        let doc = doc_from_args(args)?;
         let id = match opt_str(args, "id")? {
             Some(id) => id.to_string(),
             None => generate_id(),
@@ -548,85 +864,222 @@ impl Server {
         }))
     }
 
+    fn tool_patch(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        let id = required_str(args, "id")?;
+        let updates = updates_from_args(args)?;
+        let stored = self.db.patch(collection, id, updates)?;
+        Ok(json!({ "ok": true, "collection": collection, "id": stored }))
+    }
+
+    fn tool_delete(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        let id = required_str(args, "id")?;
+        let stored = self.db.delete(collection, id)?;
+        Ok(json!({ "ok": true, "collection": collection, "id": stored }))
+    }
+
+    fn tool_batch(&self, args: &JsonValue) -> Result<JsonValue> {
+        let mutations = args
+            .get("mutations")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| anyhow!("`mutations` must be an array"))?;
+        if mutations.is_empty() {
+            bail!("`mutations` must not be empty");
+        }
+
+        let mut batch = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            let collection = required_str(mutation, "collection")?;
+            self.ensure_collection(collection)?;
+            let op = required_str(mutation, "op")?;
+            match op {
+                "put" => {
+                    let doc = doc_from_args(mutation)?;
+                    let doc_id = match opt_str(mutation, "id")? {
+                        Some(id) => id.to_string(),
+                        None => generate_id(),
+                    };
+                    batch.push(BatchMutation::Put {
+                        collection: collection.to_string(),
+                        doc_id,
+                        doc,
+                    });
+                }
+                "patch" => {
+                    let doc_id = required_str(mutation, "id")?.to_string();
+                    let updates = updates_from_args(mutation)?;
+                    batch.push(BatchMutation::Patch {
+                        collection: collection.to_string(),
+                        doc_id,
+                        updates,
+                    });
+                }
+                "delete" => {
+                    let doc_id = required_str(mutation, "id")?.to_string();
+                    batch.push(BatchMutation::Delete {
+                        collection: collection.to_string(),
+                        doc_id,
+                    });
+                }
+                other => bail!("`op` must be put, patch, or delete, got `{other}`"),
+            }
+        }
+
+        let ids = self.db.write_batch(batch)?;
+        Ok(json!({ "ok": true, "count": ids.len(), "ids": ids }))
+    }
+
+    fn tool_collection_list(&self) -> Result<JsonValue> {
+        let stats = self.db.get_stats();
+        let collections: Vec<JsonValue> = self
+            .db
+            .list_collections()?
+            .into_iter()
+            .filter(|collection| self.config.collection_allowed(collection))
+            .map(|collection| {
+                let count = stats
+                    .get(&format!("{collection}_count"))
+                    .copied()
+                    .unwrap_or(0);
+                json!({ "name": collection, "count": count })
+            })
+            .collect();
+        Ok(json!({ "collections": collections }))
+    }
+
+    fn tool_collection_describe(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        self.ensure_collection_exists(collection)?;
+        let schema = self
+            .db
+            .schema(collection)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| anyhow!(error))?;
+        let indexes = serde_json::to_value(self.db.list_indexes(Some(collection)))
+            .map_err(|error| anyhow!(error))?;
+        let stats = stats_to_json(&self.db.collection_stats(collection)?);
+        Ok(json!({
+            "collection": collection,
+            "schema": schema,
+            "indexes": indexes,
+            "stats": stats
+        }))
+    }
+
+    fn tool_collection_stats(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        self.ensure_collection_exists(collection)?;
+        let stats = stats_to_json(&self.db.collection_stats(collection)?);
+        Ok(json!({ "collection": collection, "stats": stats }))
+    }
+
+    fn tool_schema_set(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        let schema = args
+            .get("schema")
+            .ok_or_else(|| anyhow!("missing `schema`"))?;
+        let schema: CollectionSchema = serde_json::from_value(schema.clone())
+            .map_err(|error| anyhow!("invalid schema: {error}"))?;
+        self.db.set_schema(collection, schema)?;
+        Ok(json!({ "ok": true, "collection": collection }))
+    }
+
+    fn tool_schema_clear(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        self.db.clear_schema(collection)?;
+        Ok(json!({ "ok": true, "collection": collection }))
+    }
+
+    fn ensure_collection_exists(&self, collection: &str) -> Result<()> {
+        if !self
+            .db
+            .list_collections()?
+            .iter()
+            .any(|name| name == collection)
+        {
+            bail!("collection `{collection}` does not exist");
+        }
+        Ok(())
+    }
+
     fn tool_query(&self, args: &JsonValue) -> Result<JsonValue> {
         let collection = required_str(args, "collection")?;
         self.ensure_collection(collection)?;
-        let mut query = Query::new(collection);
-
-        if let Some(filters) = args.get("filters") {
-            let filters = filters
-                .as_array()
-                .ok_or_else(|| anyhow!("`filters` must be an array"))?;
-            for filter in filters {
-                let (field, op, value) = parse_filter(filter)?;
-                query = query.where_filter(&field, op, value);
-            }
-        }
-        if let Some(filters) = args.get("any") {
-            let filters = filters
-                .as_array()
-                .ok_or_else(|| anyhow!("`any` must be an array"))?;
-            for filter in filters {
-                let (field, op, value) = parse_filter(filter)?;
-                query = query.or_where(&field, op, value);
-            }
-        }
-        if let Some(order_by) = args.get("order_by") {
-            let order_by = order_by
-                .as_array()
-                .ok_or_else(|| anyhow!("`order_by` must be an array"))?;
-            for order in order_by {
-                let field = required_str(order, "field")?;
-                let ascending = match opt_str(order, "direction")?.unwrap_or("asc") {
-                    "asc" => true,
-                    "desc" => false,
-                    other => bail!("`direction` must be asc or desc, got `{other}`"),
-                };
-                query = query.order_by(field, ascending);
-            }
-        }
-        if let Some(select) = args.get("select") {
-            let select = select
-                .as_array()
-                .ok_or_else(|| anyhow!("`select` must be an array"))?;
-            let fields = select
-                .iter()
-                .map(|field| {
-                    field
-                        .as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| anyhow!("`select` entries must be strings"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            query = query.select_fields(fields);
-        }
+        let query = query_with_order_select(query_with_filters(collection, args)?, args)?;
 
         let requested_limit = opt_usize(args, "limit", 50)?;
         let limit = requested_limit.min(self.config.max_query_rows);
-        query = query.limit(limit).offset(opt_usize(args, "offset", 0)?);
+        let offset = cursor_offset(args, opt_usize(args, "offset", 0)?)?;
+        let query = query.limit(limit.saturating_add(1)).offset(offset);
 
-        let rows = self.db.query(query)?;
+        let mut rows = self.db.query(query)?;
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.truncate(limit);
+        }
         let documents: Vec<JsonValue> = rows
             .iter()
             .map(|(id, doc)| doc.to_json_with_id(id))
             .collect();
+        let next_cursor = has_more.then(|| (offset + documents.len()).to_string());
         Ok(json!({
             "collection": collection,
             "count": documents.len(),
             "limit": limit,
+            "next_cursor": next_cursor,
             "documents": documents
         }))
+    }
+
+    fn tool_aggregate(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        let op = required_str(args, "op")?;
+        let mut query = query_with_filters(collection, args)?;
+        query = match op {
+            "count" => query.aggregate(AggregateOp::Count),
+            "sum" => query.aggregate(AggregateOp::Sum(required_str(args, "field")?.to_string())),
+            "avg" => query.aggregate(AggregateOp::Avg(required_str(args, "field")?.to_string())),
+            other => bail!("`op` must be count, sum, or avg, got `{other}`"),
+        };
+        let results = self.db.execute_aggregation(query)?;
+        Ok(json!({ "collection": collection, "op": op, "results": results }))
+    }
+
+    fn tool_explain(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        let query = query_with_order_select(query_with_filters(collection, args)?, args)?;
+        let report = self.db.explain_report(query)?;
+        let plan = serde_json::to_value(&report).map_err(|error| anyhow!(error))?;
+        Ok(json!({ "collection": collection, "plan": plan }))
     }
 
     fn tool_create_index(&self, args: &JsonValue) -> Result<JsonValue> {
         let collection = required_str(args, "collection")?;
         self.ensure_collection(collection)?;
-        let field = required_str(args, "field")?;
         let kind = required_str(args, "kind")?;
         match kind {
-            "secondary" => self.db.create_index(collection, field)?,
-            "fts" => self.db.create_fts_index(collection, field)?,
+            "secondary" => {
+                let field = required_str(args, "field")?;
+                self.db.create_index(collection, field)?;
+                Ok(json!({ "ok": true, "collection": collection, "field": field, "kind": kind }))
+            }
+            "fts" => {
+                let field = required_str(args, "field")?;
+                self.db.create_fts_index(collection, field)?;
+                Ok(json!({ "ok": true, "collection": collection, "field": field, "kind": kind }))
+            }
             "vector" => {
+                let field = required_str(args, "field")?;
                 let dim = required_u32(args, "dim")?;
                 let metric = match opt_str(args, "metric")?.unwrap_or("cosine") {
                     "cosine" => Metric::Cosine,
@@ -635,15 +1088,80 @@ impl Server {
                 };
                 self.db
                     .create_vector_index(collection, field, dim, metric)?;
+                Ok(json!({ "ok": true, "collection": collection, "field": field, "kind": kind }))
             }
-            other => bail!("`kind` must be secondary, fts, or vector, got `{other}`"),
+            "composite" => {
+                let fields = composite_fields(args)?;
+                let unique = args
+                    .get("unique")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let sparse = args
+                    .get("sparse")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(true);
+                let index_id = self
+                    .db
+                    .create_composite_index_ex(collection, fields, unique, sparse, None)?;
+                Ok(json!({
+                    "ok": true,
+                    "collection": collection,
+                    "kind": kind,
+                    "index_id": index_id
+                }))
+            }
+            "edge" => {
+                self.db.create_edge_index(collection)?;
+                Ok(json!({ "ok": true, "collection": collection, "kind": kind }))
+            }
+            "traverse" => {
+                self.db.create_traverse_index(collection)?;
+                Ok(json!({ "ok": true, "collection": collection, "kind": kind }))
+            }
+            other => bail!(
+                "`kind` must be secondary, fts, vector, composite, edge, or traverse, got `{other}`"
+            ),
         }
-        Ok(json!({
-            "ok": true,
-            "collection": collection,
-            "field": field,
-            "kind": kind
-        }))
+    }
+
+    fn tool_index_list(&self, args: &JsonValue) -> Result<JsonValue> {
+        if let Some(collection) = opt_str(args, "collection")? {
+            self.ensure_collection(collection)?;
+            let indexes = self.db.list_indexes(Some(collection));
+            return serde_json::to_value(indexes).map_err(|error| anyhow!(error));
+        }
+
+        let mut value =
+            serde_json::to_value(self.db.list_indexes(None)).map_err(|error| anyhow!(error))?;
+        filter_index_map(&mut value, "simple", &|name| {
+            self.config.collection_allowed(name)
+        });
+        filter_index_map(&mut value, "secondary", &|name| {
+            self.config.collection_allowed(name)
+        });
+        filter_index_map(&mut value, "fts", &|name| {
+            self.config.collection_allowed(name)
+        });
+        filter_index_map(&mut value, "vector", &|name| {
+            self.config.collection_allowed(name)
+        });
+        if let Some(entries) = value.get_mut("composite").and_then(JsonValue::as_array_mut) {
+            entries.retain(|entry| {
+                entry["collection"]
+                    .as_str()
+                    .map(|name| self.config.collection_allowed(name))
+                    .unwrap_or(false)
+            });
+        }
+        if let Some(entries) = value.get_mut("traverse").and_then(JsonValue::as_array_mut) {
+            entries.retain(|entry| {
+                entry
+                    .as_str()
+                    .map(|name| self.config.collection_allowed(name))
+                    .unwrap_or(false)
+            });
+        }
+        Ok(value)
     }
 
     fn tool_find_near(&self, args: &JsonValue) -> Result<JsonValue> {
@@ -753,17 +1271,37 @@ impl Server {
         let resources: Vec<JsonValue> = collections
             .into_iter()
             .filter(|collection| self.config.collection_allowed(collection))
-            .map(|collection| {
+            .flat_map(|collection| {
                 let count = stats
                     .get(&format!("{collection}_count"))
                     .copied()
                     .unwrap_or(0);
-                json!({
-                    "uri": format!("{RESOURCE_PREFIX}{collection}"),
-                    "name": collection,
-                    "description": format!("HakoDB collection ({count} documents)"),
-                    "mimeType": "application/json"
-                })
+                [
+                    json!({
+                        "uri": format!("{RESOURCE_PREFIX}{collection}"),
+                        "name": collection,
+                        "description": format!("HakoDB collection ({count} documents)"),
+                        "mimeType": "application/json"
+                    }),
+                    json!({
+                        "uri": format!("{RESOURCE_PREFIX}{collection}/schema"),
+                        "name": format!("{collection} schema"),
+                        "description": "Declared collection schema",
+                        "mimeType": "application/json"
+                    }),
+                    json!({
+                        "uri": format!("{RESOURCE_PREFIX}{collection}/indexes"),
+                        "name": format!("{collection} indexes"),
+                        "description": "Collection index definitions",
+                        "mimeType": "application/json"
+                    }),
+                    json!({
+                        "uri": format!("{RESOURCE_PREFIX}{collection}/stats"),
+                        "name": format!("{collection} stats"),
+                        "description": "Collection size and residency statistics",
+                        "mimeType": "application/json"
+                    }),
+                ]
             })
             .collect();
         Ok(json!({ "resources": resources }))
@@ -774,10 +1312,17 @@ impl Server {
             .get("uri")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| RpcError::invalid("missing resource `uri`"))?;
-        let collection = uri
+        let rest = uri
             .strip_prefix(RESOURCE_PREFIX)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| RpcError::resource_not_found(uri))?;
+        let (collection, kind) = match rest.split_once('/') {
+            Some((collection, "schema")) => (collection, "schema"),
+            Some((collection, "indexes")) => (collection, "indexes"),
+            Some((collection, "stats")) => (collection, "stats"),
+            Some(_) => return Err(RpcError::resource_not_found(uri)),
+            None => (rest, "sample"),
+        };
 
         if !self.config.collection_allowed(collection) {
             return Err(RpcError::resource_not_found(uri));
@@ -786,6 +1331,41 @@ impl Server {
         let collections = self.db.list_collections().map_err(RpcError::internal)?;
         if !collections.iter().any(|name| name == collection) {
             return Err(RpcError::resource_not_found(uri));
+        }
+
+        if kind != "sample" {
+            let value = match kind {
+                "schema" => self
+                    .db
+                    .schema(collection)
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(RpcError::internal)?
+                    .unwrap_or(JsonValue::Null),
+                "indexes" => serde_json::to_value(self.db.list_indexes(Some(collection)))
+                    .map_err(RpcError::internal)?,
+                "stats" => stats_to_json(
+                    &self
+                        .db
+                        .collection_stats(collection)
+                        .map_err(RpcError::internal)?,
+                ),
+                _ => unreachable!("kind filtered above"),
+            };
+            let text = serde_json::to_string_pretty(&value).map_err(RpcError::internal)?;
+            if text.len() > self.config.max_result_bytes {
+                return Err(RpcError::internal(format!(
+                    "resource exceeds --max-result-bytes ({})",
+                    self.config.max_result_bytes
+                )));
+            }
+            return Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": text
+                }]
+            }));
         }
 
         let count = self
@@ -876,14 +1456,14 @@ fn tool_error(message: impl Into<String>) -> JsonValue {
     })
 }
 
-fn parse_filter(filter: &JsonValue) -> Result<(String, Operator, Value)> {
+fn parse_filter(filter: &JsonValue) -> Result<Filter> {
     let field = required_str(filter, "field")?.to_string();
     let op = parse_operator(required_str(filter, "op")?)?;
     let value = filter
         .get("value")
         .ok_or_else(|| anyhow!("filter needs `value`"))?;
     let value = Value::from_json(value.clone()).map_err(|error| anyhow!(error))?;
-    Ok((field, op, value))
+    Ok(Filter { field, op, value })
 }
 
 fn parse_operator(op: &str) -> Result<Operator> {
@@ -904,6 +1484,181 @@ fn parse_operator(op: &str) -> Result<Operator> {
         "array_all_eq" => Operator::ArrayAllEq,
         "not_in" => Operator::NotIn,
         other => bail!("unknown filter operator `{other}`"),
+    })
+}
+
+fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "get" => "document_get",
+        "put" => "document_put",
+        "create_index" => "index_create",
+        other => other,
+    }
+}
+
+fn doc_from_args(args: &JsonValue) -> Result<HakoDoc> {
+    let fields = args
+        .get("doc")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| anyhow!("`doc` must be an object"))?;
+    let mut doc = HakoDoc::default();
+    for (field, value) in fields {
+        let value = Value::from_json(value.clone()).map_err(|error| anyhow!(error))?;
+        doc.insert(field.clone(), value);
+    }
+    if let Some(vectors) = args.get("vectors") {
+        let vectors = vectors
+            .as_object()
+            .ok_or_else(|| anyhow!("`vectors` must be an object"))?;
+        for (field, vector) in vectors {
+            let vector = json_to_f32s(vector)?;
+            doc.insert(field.clone(), Value::Binary(encode_f32s(&vector)));
+        }
+    }
+    Ok(doc)
+}
+
+fn updates_from_args(args: &JsonValue) -> Result<Vec<(String, Value)>> {
+    let updates = args
+        .get("updates")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| anyhow!("`updates` must be an object"))?;
+    updates
+        .iter()
+        .map(|(field, value)| {
+            Value::from_json(value.clone())
+                .map(|value| (field.clone(), value))
+                .map_err(|error| anyhow!(error))
+        })
+        .collect()
+}
+
+fn query_with_filters(collection: &str, args: &JsonValue) -> Result<Query> {
+    let mut query = Query::new(collection);
+    if let Some(filters) = args.get("filters") {
+        let filters = filters
+            .as_array()
+            .ok_or_else(|| anyhow!("`filters` must be an array"))?;
+        for filter in filters {
+            let filter = parse_filter(filter)?;
+            query = query.where_filter(&filter.field, filter.op, filter.value);
+        }
+    }
+    if let Some(filters) = args.get("any") {
+        let filters = filters
+            .as_array()
+            .ok_or_else(|| anyhow!("`any` must be an array"))?;
+        for filter in filters {
+            let filter = parse_filter(filter)?;
+            query = query.or_where(&filter.field, filter.op, filter.value);
+        }
+    }
+    if let Some(clauses) = args.get("elem_match") {
+        let clauses = clauses
+            .as_array()
+            .ok_or_else(|| anyhow!("`elem_match` must be an array"))?;
+        for clause in clauses {
+            let field = required_str(clause, "field")?;
+            let filters = clause
+                .get("filters")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| anyhow!("`elem_match.filters` must be an array"))?;
+            let filters = filters
+                .iter()
+                .map(parse_filter)
+                .collect::<Result<Vec<_>>>()?;
+            query = query.elem_match(field, filters);
+        }
+    }
+    Ok(query)
+}
+
+fn query_with_order_select(mut query: Query, args: &JsonValue) -> Result<Query> {
+    if let Some(order_by) = args.get("order_by") {
+        let order_by = order_by
+            .as_array()
+            .ok_or_else(|| anyhow!("`order_by` must be an array"))?;
+        for order in order_by {
+            let field = required_str(order, "field")?;
+            let ascending = match opt_str(order, "direction")?.unwrap_or("asc") {
+                "asc" => true,
+                "desc" => false,
+                other => bail!("`direction` must be asc or desc, got `{other}`"),
+            };
+            query = query.order_by(field, ascending);
+        }
+    }
+    if let Some(select) = args.get("select") {
+        let select = select
+            .as_array()
+            .ok_or_else(|| anyhow!("`select` must be an array"))?;
+        let fields = select
+            .iter()
+            .map(|field| {
+                field
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("`select` entries must be strings"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        query = query.select_fields(fields);
+    }
+    Ok(query)
+}
+
+fn composite_fields(args: &JsonValue) -> Result<Vec<(String, SortDirection)>> {
+    let fields = args
+        .get("fields")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| anyhow!("composite indexes need `fields`"))?;
+    if fields.is_empty() {
+        bail!("composite `fields` must not be empty");
+    }
+    fields
+        .iter()
+        .map(|entry| {
+            let field = required_str(entry, "field")?.to_string();
+            let direction = match opt_str(entry, "direction")?.unwrap_or("asc") {
+                "asc" => SortDirection::Asc,
+                "desc" => SortDirection::Desc,
+                other => bail!("`direction` must be asc or desc, got `{other}`"),
+            };
+            Ok((field, direction))
+        })
+        .collect()
+}
+
+fn cursor_offset(args: &JsonValue, offset: usize) -> Result<usize> {
+    match opt_str(args, "cursor")? {
+        Some(cursor) => {
+            if args.get("offset").is_some() {
+                bail!("use either `cursor` or `offset`, not both");
+            }
+            cursor
+                .parse::<usize>()
+                .map_err(|_| anyhow!("`cursor` must be a non-negative integer offset"))
+        }
+        None => Ok(offset),
+    }
+}
+
+fn filter_index_map(value: &mut JsonValue, key: &str, allowed: &dyn Fn(&str) -> bool) {
+    if let Some(map) = value.get_mut(key).and_then(JsonValue::as_object_mut) {
+        map.retain(|name, _| allowed(name.as_str()));
+    }
+}
+
+fn stats_to_json(stats: &CollectionStats) -> JsonValue {
+    json!({
+        "collection": stats.collection,
+        "doc_count": stats.doc_count,
+        "live_bytes": stats.live_bytes,
+        "total_bytes": stats.total_bytes,
+        "segment_count": stats.segment_count,
+        "wal_bytes": stats.wal_bytes,
+        "blob_bytes": stats.blob_bytes,
+        "tombstone_count": stats.tombstone_count,
+        "unloaded": stats.unloaded
     })
 }
 
@@ -1489,6 +2244,342 @@ mod tests {
             json!({ "name": "query", "arguments": { "collection": "docs" } }),
         );
         assert_eq!(query["result"]["isError"].as_bool(), Some(true));
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn schema_set_describe_and_clear() {
+        let (server, dir) = temp_server("schema", ServerConfig::default());
+        initialize(&server);
+
+        let set = request(
+            &server,
+            1,
+            "tools/call",
+            json!({
+                "name": "schema_set",
+                "arguments": {
+                    "collection": "notes",
+                    "schema": {
+                        "fields": [{ "name": "title", "kind": "string", "required": true }]
+                    }
+                }
+            }),
+        );
+        assert!(set["result"].get("isError").is_none(), "{set}");
+
+        let missing = request(
+            &server,
+            2,
+            "tools/call",
+            json!({
+                "name": "document_put",
+                "arguments": { "collection": "notes", "id": "n1", "doc": { "body": "no title" } }
+            }),
+        );
+        assert_eq!(missing["result"]["isError"].as_bool(), Some(true));
+
+        let ok = request(
+            &server,
+            3,
+            "tools/call",
+            json!({
+                "name": "document_put",
+                "arguments": { "collection": "notes", "id": "n1", "doc": { "title": "hello" } }
+            }),
+        );
+        assert!(ok["result"].get("isError").is_none(), "{ok}");
+
+        let describe = request(
+            &server,
+            4,
+            "tools/call",
+            json!({ "name": "collection_describe", "arguments": { "collection": "notes" } }),
+        );
+        let describe = tool_json(&describe);
+        assert_eq!(describe["schema"]["fields"][0]["name"], "title");
+        assert_eq!(describe["stats"]["doc_count"].as_u64(), Some(1));
+
+        let schema_resource = request(
+            &server,
+            5,
+            "resources/read",
+            json!({ "uri": "hakodb://collections/notes/schema" }),
+        );
+        let text = schema_resource["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("title"), "{text}");
+
+        let clear = request(
+            &server,
+            6,
+            "tools/call",
+            json!({ "name": "schema_clear", "arguments": { "collection": "notes" } }),
+        );
+        assert!(clear["result"].get("isError").is_none(), "{clear}");
+        let after = request(
+            &server,
+            7,
+            "tools/call",
+            json!({ "name": "collection_describe", "arguments": { "collection": "notes" } }),
+        );
+        assert!(tool_json(&after)["schema"].is_null());
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn patch_delete_batch_and_atomicity() {
+        let (server, dir) = temp_server("batch", ServerConfig::default());
+        initialize(&server);
+
+        let put = request(
+            &server,
+            1,
+            "tools/call",
+            json!({
+                "name": "put",
+                "arguments": { "collection": "docs", "id": "d1", "doc": { "n": 1 } }
+            }),
+        );
+        assert!(put["result"].get("isError").is_none(), "{put}");
+
+        let patch = request(
+            &server,
+            2,
+            "tools/call",
+            json!({
+                "name": "document_patch",
+                "arguments": { "collection": "docs", "id": "d1", "updates": { "n": 2 } }
+            }),
+        );
+        assert!(patch["result"].get("isError").is_none(), "{patch}");
+        let after_patch = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "get", "arguments": { "collection": "docs", "id": "d1" } }),
+        );
+        assert_eq!(tool_json(&after_patch)["document"]["n"], 2);
+
+        let batch = request(
+            &server,
+            4,
+            "tools/call",
+            json!({
+                "name": "document_batch",
+                "arguments": {
+                    "mutations": [
+                        { "op": "put", "collection": "docs", "id": "d2", "doc": { "n": 5 } },
+                        { "op": "patch", "collection": "docs", "id": "d1", "updates": { "n": 3 } },
+                        { "op": "delete", "collection": "docs", "id": "d2" }
+                    ]
+                }
+            }),
+        );
+        assert!(batch["result"].get("isError").is_none(), "{batch}");
+        let after_batch = request(
+            &server,
+            5,
+            "tools/call",
+            json!({ "name": "get", "arguments": { "collection": "docs", "id": "d1" } }),
+        );
+        assert_eq!(tool_json(&after_batch)["document"]["n"], 3);
+        let deleted = request(
+            &server,
+            6,
+            "tools/call",
+            json!({ "name": "document_get", "arguments": { "collection": "docs", "id": "d2" } }),
+        );
+        assert_eq!(tool_json(&deleted)["found"], false);
+
+        let invalid = request(
+            &server,
+            7,
+            "tools/call",
+            json!({
+                "name": "document_batch",
+                "arguments": {
+                    "mutations": [
+                        { "op": "put", "collection": "docs", "id": "d3", "doc": { "n": 9 } },
+                        { "op": "nope", "collection": "docs" }
+                    ]
+                }
+            }),
+        );
+        assert_eq!(invalid["result"]["isError"].as_bool(), Some(true));
+        let not_written = request(
+            &server,
+            8,
+            "tools/call",
+            json!({ "name": "document_get", "arguments": { "collection": "docs", "id": "d3" } }),
+        );
+        assert_eq!(tool_json(&not_written)["found"], false);
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn aggregate_and_explain() {
+        let (server, dir) = temp_server("aggregate", ServerConfig::default());
+        initialize(&server);
+        for (id, n) in [("d1", 1), ("d2", 2), ("d3", 3)] {
+            let put = request(
+                &server,
+                0,
+                "tools/call",
+                json!({
+                    "name": "document_put",
+                    "arguments": { "collection": "docs", "id": id, "doc": { "n": n } }
+                }),
+            );
+            assert!(put["result"].get("isError").is_none(), "{put}");
+        }
+
+        let count = request(
+            &server,
+            1,
+            "tools/call",
+            json!({ "name": "aggregate", "arguments": { "collection": "docs", "op": "count" } }),
+        );
+        assert_eq!(tool_json(&count)["results"]["count"].as_f64(), Some(3.0));
+
+        let sum = request(
+            &server,
+            2,
+            "tools/call",
+            json!({ "name": "aggregate", "arguments": { "collection": "docs", "op": "sum", "field": "n" } }),
+        );
+        assert_eq!(tool_json(&sum)["results"]["sum_n"].as_f64(), Some(6.0));
+
+        let avg = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "aggregate", "arguments": { "collection": "docs", "op": "avg", "field": "n" } }),
+        );
+        assert_eq!(tool_json(&avg)["results"]["avg_n"].as_f64(), Some(2.0));
+
+        let explain = request(
+            &server,
+            4,
+            "tools/call",
+            json!({ "name": "explain", "arguments": { "collection": "docs" } }),
+        );
+        let explain = tool_json(&explain);
+        assert_eq!(explain["plan"]["collection"], "docs");
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn index_create_and_list() {
+        let (server, dir) = temp_server("indexes", ServerConfig::default());
+        initialize(&server);
+        let secondary = request(
+            &server,
+            1,
+            "tools/call",
+            json!({
+                "name": "create_index",
+                "arguments": { "collection": "docs", "field": "n", "kind": "secondary" }
+            }),
+        );
+        assert!(secondary["result"].get("isError").is_none(), "{secondary}");
+
+        let composite = request(
+            &server,
+            2,
+            "tools/call",
+            json!({
+                "name": "index_create",
+                "arguments": {
+                    "collection": "docs",
+                    "kind": "composite",
+                    "fields": [{ "field": "n", "direction": "asc" }]
+                }
+            }),
+        );
+        assert!(composite["result"].get("isError").is_none(), "{composite}");
+
+        let list = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "index_list", "arguments": { "collection": "docs" } }),
+        );
+        let list = tool_json(&list);
+        assert!(list["secondary"]["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "n"));
+        assert!(list["composite"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|index| index["collection"] == "docs"));
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn query_cursor_pagination() {
+        let (server, dir) = temp_server("cursor", ServerConfig::default());
+        initialize(&server);
+        for index in 0..5 {
+            let put = request(
+                &server,
+                0,
+                "tools/call",
+                json!({
+                    "name": "document_put",
+                    "arguments": {
+                        "collection": "docs",
+                        "id": format!("d{index}"),
+                        "doc": { "n": index }
+                    }
+                }),
+            );
+            assert!(put["result"].get("isError").is_none(), "{put}");
+        }
+
+        let first = request(
+            &server,
+            1,
+            "tools/call",
+            json!({ "name": "query", "arguments": { "collection": "docs", "limit": 2 } }),
+        );
+        let first = tool_json(&first);
+        assert_eq!(first["count"].as_u64(), Some(2));
+        assert_eq!(first["next_cursor"].as_str(), Some("2"));
+
+        let second = request(
+            &server,
+            2,
+            "tools/call",
+            json!({ "name": "query", "arguments": { "collection": "docs", "limit": 2, "cursor": "2" } }),
+        );
+        let second = tool_json(&second);
+        assert_eq!(second["count"].as_u64(), Some(2));
+        assert_eq!(second["next_cursor"].as_str(), Some("4"));
+
+        let third = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "query", "arguments": { "collection": "docs", "limit": 2, "cursor": "4" } }),
+        );
+        let third = tool_json(&third);
+        assert_eq!(third["count"].as_u64(), Some(1));
+        assert!(third["next_cursor"].is_null());
 
         drop(server);
         let _ = std::fs::remove_dir_all(dir);
