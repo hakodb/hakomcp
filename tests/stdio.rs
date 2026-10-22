@@ -298,7 +298,7 @@ fn restart_recovers_documents_after_a_hard_kill() {
     let dir = temp_dir("restart");
     let db = dir.to_string_lossy().to_string();
 
-    let mut first = Client::spawn(&["--db", &db]);
+    let mut first = Client::spawn(&["--db", &db, "--profile", "admin"]);
     first.initialize();
     let put = first.call(
         2,
@@ -306,6 +306,8 @@ fn restart_recovers_documents_after_a_hard_kill() {
         json!({ "collection": "notes", "id": "n1", "doc": { "title": "durable" } }),
     );
     assert!(put["result"].get("isError").is_none(), "{put}");
+    let flush = first.call(3, "flush", json!({}));
+    assert!(flush["result"].get("isError").is_none(), "{flush}");
     first.kill();
 
     let mut second = Client::spawn(&["--db", &db]);
