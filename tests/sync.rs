@@ -231,14 +231,55 @@ fn mesh_sync_converges_writes_and_deletes() {
         (got["found"] == false).then_some(())
     });
 
-    let status = a.call(5, "sync_status", json!({}));
+    let mutations: Vec<JsonValue> = (0..50)
+        .map(|index| {
+            json!({
+                "op": "put",
+                "collection": "notes",
+                "id": format!("bulk-{index}"),
+                "doc": { "index": index, "payload": "x".repeat(2048) }
+            })
+        })
+        .collect();
+    a.call(5, "document_batch", json!({ "mutations": mutations }));
+    wait_for("bulk replication", || {
+        next_id += 1;
+        let query = b.call(
+            next_id,
+            "query",
+            json!({ "collection": "notes", "filters": [{ "field": "index", "op": "gte", "value": 0 }], "limit": 100 }),
+        );
+        (query["count"].as_u64().unwrap_or(0) == 50).then_some(())
+    });
+
+    let deletes: Vec<JsonValue> = (0..50)
+        .map(|index| {
+            json!({
+                "op": "delete",
+                "collection": "notes",
+                "id": format!("bulk-{index}")
+            })
+        })
+        .collect();
+    a.call(6, "document_batch", json!({ "mutations": deletes }));
+    wait_for("bulk delete replication", || {
+        next_id += 1;
+        let query = b.call(
+            next_id,
+            "query",
+            json!({ "collection": "notes", "limit": 100 }),
+        );
+        (query["count"].as_u64().unwrap_or(1) == 0).then_some(())
+    });
+
+    let status = a.call(7, "sync_status", json!({}));
     assert_eq!(status["active"], true);
     assert_eq!(status["mode"], "mesh");
     assert!(status.get("room_key").is_none(), "{status}");
     assert!(!status.to_string().contains(secret));
 
-    a.call(6, "sync_stop", json!({}));
-    b.call(6, "sync_stop", json!({}));
+    a.call(8, "sync_stop", json!({}));
+    b.call(8, "sync_stop", json!({}));
 
     let _ = std::fs::remove_dir_all(dir_a);
     let _ = std::fs::remove_dir_all(dir_b);
