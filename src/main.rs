@@ -1,18 +1,20 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use hakodb::config::HakoConfig;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::engine::CollectionStats;
-use hakodb::engine::{BatchMutation, Hako};
+use hakodb::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
 use hakodb::index::composite::definition::SortDirection;
 use hakodb::index::traverse::{TraverseDir, TraverseSpec};
 use hakodb::index::vector::{decode_f32s, distance, encode_f32s, Metric};
 use hakodb::query::filter::{Filter, Operator};
+use hakodb::query::plan::QueryPlan;
 use hakodb::query::query::{AggregateOp, Query};
 use hakodb::schema::CollectionSchema;
 use serde_json::{json, Value as JsonValue};
@@ -103,10 +105,17 @@ impl Profile {
             | "aggregate"
             | "explain"
             | "index_list"
-            | "server_status" => true,
+            | "server_status"
+            | "job_list"
+            | "job_get"
+            | "watch_create"
+            | "watch_delete" => true,
             "document_put" | "document_patch" | "document_delete" | "document_batch"
             | "index_create" | "schema_set" | "schema_clear" => {
                 matches!(self, Self::Data | Self::Sync | Self::Admin)
+            }
+            "job_cancel" | "compact" | "vacuum" | "flush" | "documents_delete_where" => {
+                matches!(self, Self::Admin)
             }
             _ => false,
         }
@@ -197,14 +206,174 @@ struct Cli {
     config: ServerConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobState {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl JobState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JobRecord {
+    id: String,
+    kind: String,
+    state: JobState,
+    progress: f64,
+    created_at: u64,
+    started_at: Option<u64>,
+    finished_at: Option<u64>,
+    result: Option<JsonValue>,
+    error: Option<String>,
+    cancellable: bool,
+}
+
+impl JobRecord {
+    fn to_json(&self) -> JsonValue {
+        json!({
+            "id": self.id,
+            "kind": self.kind,
+            "state": self.state.as_str(),
+            "progress": self.progress,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "result": self.result,
+            "error": self.error,
+            "cancellable": self.cancellable
+        })
+    }
+}
+
+struct JobManager {
+    jobs: Mutex<HashMap<String, JobRecord>>,
+    next_id: AtomicU64,
+}
+
+impl JobManager {
+    fn new() -> Self {
+        Self {
+            jobs: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn create(&self, kind: &str, cancellable: bool) -> String {
+        let id = format!("job-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let record = JobRecord {
+            id: id.clone(),
+            kind: kind.to_string(),
+            state: JobState::Queued,
+            progress: 0.0,
+            created_at: now_millis(),
+            started_at: None,
+            finished_at: None,
+            result: None,
+            error: None,
+            cancellable,
+        };
+        self.jobs.lock().unwrap().insert(id.clone(), record);
+        id
+    }
+
+    fn start(&self, id: &str) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+            job.state = JobState::Running;
+            job.started_at = Some(now_millis());
+        }
+    }
+
+    fn progress(&self, id: &str, progress: f64) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+            job.progress = progress;
+        }
+    }
+
+    fn succeed(&self, id: &str, result: JsonValue) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+            job.state = JobState::Succeeded;
+            job.progress = 1.0;
+            job.finished_at = Some(now_millis());
+            job.result = Some(result);
+        }
+    }
+
+    fn fail(&self, id: &str, error: String) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+            job.state = JobState::Failed;
+            job.finished_at = Some(now_millis());
+            job.error = Some(error);
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<JobRecord> {
+        self.jobs.lock().unwrap().get(id).cloned()
+    }
+
+    fn list(&self) -> Vec<JobRecord> {
+        let mut jobs: Vec<JobRecord> = self.jobs.lock().unwrap().values().cloned().collect();
+        jobs.sort_by_key(|job| job.created_at);
+        jobs
+    }
+
+    fn cancel(&self, id: &str) -> std::result::Result<(), String> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let Some(job) = jobs.get_mut(id) else {
+            return Err(format!("unknown job `{id}`"));
+        };
+        if !job.cancellable {
+            return Err(format!("job `{id}` is not cancellable"));
+        }
+        match job.state {
+            JobState::Queued | JobState::Running => {
+                job.state = JobState::Cancelled;
+                job.finished_at = Some(now_millis());
+                Ok(())
+            }
+            state => Err(format!("job `{id}` is already {}", state.as_str())),
+        }
+    }
+}
+
+struct Watch {
+    id: String,
+    collection: String,
+    plan: QueryPlan,
+    matched: HashSet<String>,
+}
+
 struct Server {
     db: Arc<Hako>,
     config: ServerConfig,
     initialized: AtomicBool,
+    notifier: Option<tokio::sync::mpsc::Sender<JsonValue>>,
+    subscriptions: Arc<Mutex<HashSet<String>>>,
+    watches: Arc<Mutex<HashMap<String, Watch>>>,
+    watch_collections: Arc<Mutex<HashSet<String>>>,
+    next_watch_id: AtomicU64,
+    jobs: Arc<JobManager>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Server {
-    fn new(db: Arc<Hako>, config: ServerConfig) -> Self {
+    fn new(
+        db: Arc<Hako>,
+        config: ServerConfig,
+        notifier: Option<tokio::sync::mpsc::Sender<JsonValue>>,
+    ) -> Self {
         if config.profile == Profile::Read {
             db.set_read_only(true);
         }
@@ -212,6 +381,13 @@ impl Server {
             db,
             config,
             initialized: AtomicBool::new(false),
+            notifier,
+            subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            watches: Arc::new(Mutex::new(HashMap::new())),
+            watch_collections: Arc::new(Mutex::new(HashSet::new())),
+            next_watch_id: AtomicU64::new(1),
+            jobs: Arc::new(JobManager::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -261,13 +437,8 @@ impl Server {
             "resources/list" => self.resources_list(),
             "resources/read" => self.resources_read(&params),
             "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
-            "resources/subscribe" | "resources/unsubscribe" => {
-                Err(RpcError::invalid(if self.config.subscriptions_enabled() {
-                    "subscriptions are not implemented yet"
-                } else {
-                    "subscriptions are disabled; set --subscribe-to to opt in"
-                }))
-            }
+            "resources/subscribe" => self.resources_subscribe(&params),
+            "resources/unsubscribe" => self.resources_unsubscribe(&params),
             _ => Err(RpcError::method_not_found(method)),
         };
 
@@ -282,7 +453,10 @@ impl Server {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {
                 "tools": { "listChanged": false },
-                "resources": { "subscribe": false, "listChanged": false }
+                "resources": {
+                    "subscribe": self.config.subscriptions_enabled(),
+                    "listChanged": false
+                }
             },
             "serverInfo": {
                 "name": "hakomcp",
@@ -294,9 +468,9 @@ impl Server {
 
     fn instructions(&self) -> String {
         let subscriptions = if self.config.subscriptions_enabled() {
-            "Change subscriptions are configured but not active in this build."
+            "Change subscriptions are enabled only for the --subscribe-to collections."
         } else {
-            "Change notifications are disabled."
+            "Change notifications are disabled; set --subscribe-to to opt in."
         };
         format!(
             "hakomcp {} controls one local HakoDB database. Profile: {}. Query rows are capped at {}. Tool results are capped at {} bytes. {} MCP is the control plane; HakoDB mesh/cloud sync is the data plane. Do not use this server as a high-QPS application driver.",
@@ -738,6 +912,182 @@ impl Server {
                 }
             }),
             json!({
+                "name": "job_list",
+                "description": "List recent background jobs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "job_get",
+                "description": "Return one background job by id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            }),
+            json!({
+                "name": "job_cancel",
+                "description": "Cancel a job when the job declares itself cancellable.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            }),
+            json!({
+                "name": "compact",
+                "description": "Start a background full-database compaction job.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "vacuum",
+                "description": "Start a background vacuum job for one collection or all allowed collections.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "flush",
+                "description": "Flush WAL and blobs to disk.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "documents_delete_where",
+                "description": "Count or delete documents matching a query. Always dry-run first; deletion needs --allow-destructive.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "filters": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "any": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "elem_match": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "field": { "type": "string" },
+                                    "filters": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/$defs/filter" }
+                                    }
+                                },
+                                "required": ["field", "filters"]
+                            }
+                        },
+                        "dry_run": { "type": "boolean" }
+                    },
+                    "required": ["collection", "dry_run"],
+                    "$defs": {
+                        "filter": {
+                            "type": "object",
+                            "properties": {
+                                "field": { "type": "string" },
+                                "op": {
+                                    "type": "string",
+                                    "enum": [
+                                        "eq", "ne", "gt", "gte", "lt", "lte",
+                                        "match", "match_prefix", "contains",
+                                        "starts_with", "in", "array_contains",
+                                        "array_contains_any", "array_all_eq", "not_in"
+                                    ]
+                                },
+                                "value": {}
+                            },
+                            "required": ["field", "op", "value"]
+                        }
+                    }
+                }
+            }),
+            json!({
+                "name": "watch_create",
+                "description": "Create a filtered watch for an allowlisted collection. Notifications arrive on hakodb://watches/{id}.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "filters": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "any": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/filter" }
+                        },
+                        "elem_match": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "field": { "type": "string" },
+                                    "filters": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/$defs/filter" }
+                                    }
+                                },
+                                "required": ["field", "filters"]
+                            }
+                        }
+                    },
+                    "required": ["collection"],
+                    "$defs": {
+                        "filter": {
+                            "type": "object",
+                            "properties": {
+                                "field": { "type": "string" },
+                                "op": {
+                                    "type": "string",
+                                    "enum": [
+                                        "eq", "ne", "gt", "gte", "lt", "lte",
+                                        "match", "match_prefix", "contains",
+                                        "starts_with", "in", "array_contains",
+                                        "array_contains_any", "array_all_eq", "not_in"
+                                    ]
+                                },
+                                "value": {}
+                            },
+                            "required": ["field", "op", "value"]
+                        }
+                    }
+                }
+            }),
+            json!({
+                "name": "watch_delete",
+                "description": "Remove a filtered watch by id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "required": ["id"]
+                }
+            }),
+            json!({
                 "name": "server_status",
                 "description": "Return hakomcp version, engine, profile, limits, and subscription state.",
                 "inputSchema": {
@@ -782,6 +1132,15 @@ impl Server {
                 | "schema_clear"
                 | "find_near"
                 | "find_paths"
+                | "job_list"
+                | "job_get"
+                | "job_cancel"
+                | "compact"
+                | "vacuum"
+                | "flush"
+                | "documents_delete_where"
+                | "watch_create"
+                | "watch_delete"
                 | "server_status"
         );
         if !known {
@@ -817,6 +1176,15 @@ impl Server {
             "schema_clear" => self.tool_schema_clear(&args),
             "find_near" => self.tool_find_near(&args),
             "find_paths" => self.tool_find_paths(&args),
+            "job_list" => self.tool_job_list(),
+            "job_get" => self.tool_job_get(&args),
+            "job_cancel" => self.tool_job_cancel(&args),
+            "compact" => self.tool_compact(),
+            "vacuum" => self.tool_vacuum(&args),
+            "flush" => self.tool_flush(),
+            "documents_delete_where" => self.tool_delete_where(&args),
+            "watch_create" => self.tool_watch_create(&args),
+            "watch_delete" => self.tool_watch_delete(&args),
             "server_status" => self.tool_server_status(),
             _ => unreachable!("known tool handled above"),
         };
@@ -1164,6 +1532,221 @@ impl Server {
         Ok(value)
     }
 
+    fn ensure_subscribe_collection(&self, collection: &str) -> Result<()> {
+        if !self.config.subscriptions_enabled() {
+            bail!("subscriptions are disabled; set --subscribe-to to opt in");
+        }
+        if !pattern_match(&self.config.subscribe_to, collection) {
+            bail!("collection `{collection}` is not in --subscribe-to");
+        }
+        Ok(())
+    }
+
+    fn ensure_collection_watcher(&self, collection: &str) {
+        let mut started = self.watch_collections.lock().unwrap();
+        if !started.insert(collection.to_string()) {
+            return;
+        }
+        drop(started);
+
+        // Register before returning so a write that follows the subscribe
+        // response cannot race the watcher thread startup.
+        let receiver = self.db.watch_collection(collection);
+        let db = self.db.clone();
+        let notifier = self.notifier.clone();
+        let subscriptions = self.subscriptions.clone();
+        let watches = self.watches.clone();
+        let shutdown = self.shutdown.clone();
+        let collection = collection.to_string();
+        std::thread::spawn(move || {
+            watcher_loop(
+                receiver,
+                db,
+                notifier,
+                subscriptions,
+                watches,
+                shutdown,
+                collection,
+            );
+        });
+    }
+
+    fn resources_subscribe(&self, params: &JsonValue) -> RpcResult<JsonValue> {
+        if !self.config.subscriptions_enabled() {
+            return Err(RpcError::invalid(
+                "subscriptions are disabled; set --subscribe-to to opt in",
+            ));
+        }
+        let uri = params
+            .get("uri")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| RpcError::invalid("missing resource `uri`"))?;
+        let collection = uri
+            .strip_prefix(RESOURCE_PREFIX)
+            .filter(|name| !name.is_empty() && !name.contains('/'))
+            .ok_or_else(|| RpcError::invalid("only collection resources can be subscribed"))?;
+        if !self.config.collection_allowed(collection)
+            || !pattern_match(&self.config.subscribe_to, collection)
+        {
+            return Err(RpcError::resource_not_found(uri));
+        }
+        self.subscriptions.lock().unwrap().insert(uri.to_string());
+        self.ensure_collection_watcher(collection);
+        Ok(json!({}))
+    }
+
+    fn resources_unsubscribe(&self, params: &JsonValue) -> RpcResult<JsonValue> {
+        let uri = params
+            .get("uri")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| RpcError::invalid("missing resource `uri`"))?;
+        self.subscriptions.lock().unwrap().remove(uri);
+        Ok(json!({}))
+    }
+
+    fn tool_watch_create(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        self.ensure_subscribe_collection(collection)?;
+        let query = query_with_filters(collection, args)?;
+        let plan = self.db.plan_for_watch(&query);
+        let id = format!(
+            "watch-{}",
+            self.next_watch_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let uri = format!("hakodb://watches/{id}");
+        self.watches.lock().unwrap().insert(
+            id.clone(),
+            Watch {
+                id: id.clone(),
+                collection: collection.to_string(),
+                plan,
+                matched: HashSet::new(),
+            },
+        );
+        self.ensure_collection_watcher(collection);
+        Ok(json!({ "ok": true, "id": id, "uri": uri }))
+    }
+
+    fn tool_watch_delete(&self, args: &JsonValue) -> Result<JsonValue> {
+        let id = required_str(args, "id")?;
+        let removed = self.watches.lock().unwrap().remove(id).is_some();
+        if !removed {
+            bail!("unknown watch `{id}`");
+        }
+        Ok(json!({ "ok": true, "id": id }))
+    }
+
+    fn tool_job_list(&self) -> Result<JsonValue> {
+        let jobs: Vec<JsonValue> = self.jobs.list().iter().map(JobRecord::to_json).collect();
+        Ok(json!({ "jobs": jobs }))
+    }
+
+    fn tool_job_get(&self, args: &JsonValue) -> Result<JsonValue> {
+        let id = required_str(args, "id")?;
+        let job = self
+            .jobs
+            .get(id)
+            .ok_or_else(|| anyhow!("unknown job `{id}`"))?;
+        Ok(job.to_json())
+    }
+
+    fn tool_job_cancel(&self, args: &JsonValue) -> Result<JsonValue> {
+        let id = required_str(args, "id")?;
+        self.jobs.cancel(id).map_err(|error| anyhow!(error))?;
+        Ok(json!({ "ok": true, "id": id }))
+    }
+
+    fn tool_compact(&self) -> Result<JsonValue> {
+        let id = self.jobs.create("compact", false);
+        let jobs = self.jobs.clone();
+        let db = self.db.clone();
+        let job_id = id.clone();
+        std::thread::spawn(move || {
+            jobs.start(&job_id);
+            match db.compact() {
+                Ok(()) => jobs.succeed(&job_id, json!({ "ok": true })),
+                Err(error) => jobs.fail(&job_id, error.to_string()),
+            }
+        });
+        Ok(json!({ "ok": true, "job_id": id }))
+    }
+
+    fn tool_vacuum(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collections: Vec<String> = match opt_str(args, "collection")? {
+            Some(collection) => {
+                self.ensure_collection(collection)?;
+                vec![collection.to_string()]
+            }
+            None => self
+                .db
+                .list_collections()?
+                .into_iter()
+                .filter(|collection| self.config.collection_allowed(collection))
+                .collect(),
+        };
+        if collections.is_empty() {
+            bail!("no collections to vacuum");
+        }
+
+        let id = self.jobs.create("vacuum", false);
+        let jobs = self.jobs.clone();
+        let db = self.db.clone();
+        let job_id = id.clone();
+        std::thread::spawn(move || {
+            jobs.start(&job_id);
+            let total = collections.len();
+            for (index, collection) in collections.iter().enumerate() {
+                if let Err(error) = db.vacuum(collection) {
+                    jobs.fail(&job_id, error.to_string());
+                    return;
+                }
+                jobs.progress(&job_id, (index + 1) as f64 / total as f64);
+            }
+            jobs.succeed(&job_id, json!({ "ok": true, "collections": total }));
+        });
+        Ok(json!({ "ok": true, "job_id": id }))
+    }
+
+    fn tool_flush(&self) -> Result<JsonValue> {
+        self.db.flush()?;
+        Ok(json!({ "ok": true }))
+    }
+
+    fn tool_delete_where(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        let dry_run = args
+            .get("dry_run")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| anyhow!("`dry_run` must be a boolean"))?;
+        let query = query_with_filters(collection, args)?;
+
+        if dry_run {
+            let count = self
+                .db
+                .execute_aggregation(query.aggregate(AggregateOp::Count))?;
+            let count = count.get("count").copied().unwrap_or(0.0) as u64;
+            return Ok(json!({ "dry_run": true, "count": count }));
+        }
+        if !self.config.allow_destructive {
+            bail!("actual deletion requires --allow-destructive");
+        }
+
+        let id = self.jobs.create("documents_delete_where", false);
+        let jobs = self.jobs.clone();
+        let db = self.db.clone();
+        let job_id = id.clone();
+        std::thread::spawn(move || {
+            jobs.start(&job_id);
+            match db.delete_where(query) {
+                Ok(deleted) => jobs.succeed(&job_id, json!({ "deleted": deleted })),
+                Err(error) => jobs.fail(&job_id, error.to_string()),
+            }
+        });
+        Ok(json!({ "ok": true, "job_id": id }))
+    }
+
     fn tool_find_near(&self, args: &JsonValue) -> Result<JsonValue> {
         let collection = required_str(args, "collection")?;
         self.ensure_collection(collection)?;
@@ -1257,9 +1840,11 @@ impl Server {
             },
             "subscriptions": {
                 "enabled": self.config.subscriptions_enabled(),
-                "active": false,
+                "active": self.subscriptions.lock().unwrap().len(),
                 "collections": self.config.subscribe_to
             },
+            "watches": self.watches.lock().unwrap().len(),
+            "jobs": self.jobs.list().len(),
             "network": { "enabled": self.config.allow_network },
             "destructive": { "enabled": self.config.allow_destructive }
         }))
@@ -1268,7 +1853,7 @@ impl Server {
     fn resources_list(&self) -> RpcResult<JsonValue> {
         let collections = self.db.list_collections().map_err(RpcError::internal)?;
         let stats = self.db.get_stats();
-        let resources: Vec<JsonValue> = collections
+        let mut resources: Vec<JsonValue> = collections
             .into_iter()
             .filter(|collection| self.config.collection_allowed(collection))
             .flat_map(|collection| {
@@ -1304,7 +1889,44 @@ impl Server {
                 ]
             })
             .collect();
+        resources.push(json!({
+            "uri": "hakodb://server/status",
+            "name": "server status",
+            "description": "hakomcp profile, limits, and subscription state",
+            "mimeType": "application/json"
+        }));
+        resources.push(json!({
+            "uri": "hakodb://server/jobs",
+            "name": "jobs",
+            "description": "Recent background jobs",
+            "mimeType": "application/json"
+        }));
+        for watch in self.watches.lock().unwrap().values() {
+            resources.push(json!({
+                "uri": format!("hakodb://watches/{}", watch.id),
+                "name": format!("watch {}", watch.id),
+                "description": format!("Filtered watch on {}", watch.collection),
+                "mimeType": "application/json"
+            }));
+        }
         Ok(json!({ "resources": resources }))
+    }
+
+    fn resource_json(&self, uri: &str, value: &JsonValue) -> RpcResult<JsonValue> {
+        let text = serde_json::to_string_pretty(value).map_err(RpcError::internal)?;
+        if text.len() > self.config.max_result_bytes {
+            return Err(RpcError::internal(format!(
+                "resource exceeds --max-result-bytes ({})",
+                self.config.max_result_bytes
+            )));
+        }
+        Ok(json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": text
+            }]
+        }))
     }
 
     fn resources_read(&self, params: &JsonValue) -> RpcResult<JsonValue> {
@@ -1312,6 +1934,34 @@ impl Server {
             .get("uri")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| RpcError::invalid("missing resource `uri`"))?;
+
+        if uri == "hakodb://server/status" {
+            let status = self.tool_server_status().map_err(RpcError::internal)?;
+            return self.resource_json(uri, &status);
+        }
+        if uri == "hakodb://server/jobs" {
+            let jobs = self.tool_job_list().map_err(RpcError::internal)?;
+            return self.resource_json(uri, &jobs);
+        }
+        if let Some(id) = uri.strip_prefix("hakodb://server/jobs/") {
+            let job = self
+                .tool_job_get(&json!({ "id": id }))
+                .map_err(RpcError::internal)?;
+            return self.resource_json(uri, &job);
+        }
+        if let Some(id) = uri.strip_prefix("hakodb://watches/") {
+            let watches = self.watches.lock().unwrap();
+            let Some(watch) = watches.get(id) else {
+                return Err(RpcError::resource_not_found(uri));
+            };
+            let value = json!({
+                "id": watch.id,
+                "collection": watch.collection,
+                "matched": watch.matched.len()
+            });
+            return self.resource_json(uri, &value);
+        }
+
         let rest = uri
             .strip_prefix(RESOURCE_PREFIX)
             .filter(|name| !name.is_empty())
@@ -1726,6 +2376,134 @@ fn generate_id() -> String {
     format!("{nanos:032x}")
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn change_kind(kind: &ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Put => "put",
+        ChangeKind::Delete => "delete",
+    }
+}
+
+fn watcher_loop(
+    receiver: std::sync::mpsc::Receiver<ChangeEvent>,
+    db: Arc<Hako>,
+    notifier: Option<tokio::sync::mpsc::Sender<JsonValue>>,
+    subscriptions: Arc<Mutex<HashSet<String>>>,
+    watches: Arc<Mutex<HashMap<String, Watch>>>,
+    shutdown: Arc<AtomicBool>,
+    collection: String,
+) {
+    let subscription_uri = format!("{RESOURCE_PREFIX}{collection}");
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let event = match receiver.recv_timeout(Duration::from_millis(250)) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let subscribed = subscriptions.lock().unwrap().contains(&subscription_uri);
+                let has_watch = watches
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|watch| watch.collection == collection);
+                if !subscribed && !has_watch {
+                    break;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let mut events = vec![event];
+        while !shutdown.load(Ordering::Relaxed) {
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(event) => events.push(event),
+                Err(_) => break,
+            }
+        }
+
+        if subscriptions.lock().unwrap().contains(&subscription_uri) {
+            if let Some(notifier) = &notifier {
+                let last = events.last().expect("events is never empty");
+                let notification = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": {
+                        "uri": subscription_uri,
+                        "hako": {
+                            "events": events.len(),
+                            "id": last.path,
+                            "kind": change_kind(&last.kind)
+                        }
+                    }
+                });
+                let _ = notifier.try_send(notification);
+            }
+        }
+
+        let mut updates = Vec::new();
+        {
+            let mut guard = watches.lock().unwrap();
+            for watch in guard
+                .values_mut()
+                .filter(|watch| watch.collection == collection)
+            {
+                for event in &events {
+                    let id = event.path.to_string();
+                    match &event.kind {
+                        ChangeKind::Put => {
+                            let matched = db
+                                .get_raw_bytes(&collection, &id)
+                                .ok()
+                                .flatten()
+                                .map(|bytes| Hako::matches_watch(&id, &bytes, &watch.plan))
+                                .unwrap_or(false);
+                            let was_matched = watch.matched.contains(&id);
+                            if matched && !was_matched {
+                                watch.matched.insert(id.clone());
+                                updates.push((watch.id.clone(), id, "matched"));
+                            } else if !matched && was_matched {
+                                watch.matched.remove(&id);
+                                updates.push((watch.id.clone(), id, "unmatched"));
+                            }
+                        }
+                        ChangeKind::Delete => {
+                            if watch.matched.remove(&id) {
+                                updates.push((watch.id.clone(), id, "deleted"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(notifier) = &notifier {
+            for (watch_id, id, kind) in updates {
+                let notification = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/resources/updated",
+                    "params": {
+                        "uri": format!("hakodb://watches/{watch_id}"),
+                        "hako": {
+                            "collection": collection,
+                            "id": id,
+                            "kind": kind
+                        }
+                    }
+                });
+                let _ = notifier.try_send(notification);
+            }
+        }
+    }
+}
+
 fn pattern_match(patterns: &[String], name: &str) -> bool {
     patterns
         .iter()
@@ -1837,7 +2615,9 @@ fn print_help() {
         "  --allow-network            allow sync network listeners (required by --profile sync)"
     );
     println!("  --allow-destructive        allow destructive admin operations");
-    println!("  --subscribe-to LIST        collection allowlist for future change notifications");
+    println!(
+        "  --subscribe-to LIST        collection allowlist for change notifications and watches"
+    );
     println!(
         "  --collection-allow LIST    only these collections are visible; supports trailing *"
     );
@@ -1869,12 +2649,11 @@ async fn run() -> Result<()> {
         Hako::open(&cli.db, HakoConfig::default())
             .with_context(|| format!("open database at {}", cli.db.display()))?,
     );
-    let server = Arc::new(Server::new(db, cli.config.clone()));
-    server.log(&format!("database {}", cli.db.display()));
-    server.log(&format!("profile {}", cli.config.profile.as_str()));
-
     let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<String>(64);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<JsonValue>(64);
+    let server = Arc::new(Server::new(db, cli.config.clone(), Some(out_tx.clone())));
+    server.log(&format!("database {}", cli.db.display()));
+    server.log(&format!("profile {}", cli.config.profile.as_str()));
 
     let worker = {
         let server = server.clone();
@@ -1925,8 +2704,9 @@ async fn run() -> Result<()> {
         }
     }
     drop(in_tx);
-
     worker.await.context("worker task join")?;
+    server.shutdown.store(true, Ordering::SeqCst);
+    drop(server);
     writer.await.context("writer task join")??;
     Ok(())
 }
@@ -1944,7 +2724,7 @@ mod tests {
             std::env::temp_dir().join(format!("hakomcp-{tag}-{}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let db = Arc::new(Hako::open(&dir, HakoConfig::default()).unwrap());
-        (Arc::new(Server::new(db, config)), dir)
+        (Arc::new(Server::new(db, config, None)), dir)
     }
 
     fn request(server: &Server, id: u64, method: &str, params: JsonValue) -> JsonValue {
@@ -2580,6 +3360,124 @@ mod tests {
         let third = tool_json(&third);
         assert_eq!(third["count"].as_u64(), Some(1));
         assert!(third["next_cursor"].is_null());
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn jobs_and_delete_where_guards() {
+        let config = ServerConfig {
+            profile: Profile::Admin,
+            allow_destructive: false,
+            ..ServerConfig::default()
+        };
+        let (server, dir) = temp_server("jobs", config);
+        initialize(&server);
+        for index in 0..3 {
+            let put = request(
+                &server,
+                0,
+                "tools/call",
+                json!({
+                    "name": "document_put",
+                    "arguments": { "collection": "docs", "id": format!("d{index}"), "doc": { "n": index } }
+                }),
+            );
+            assert!(put["result"].get("isError").is_none(), "{put}");
+        }
+
+        let dry = request(
+            &server,
+            1,
+            "tools/call",
+            json!({
+                "name": "documents_delete_where",
+                "arguments": { "collection": "docs", "dry_run": true, "filters": [{ "field": "n", "op": "gte", "value": 1 }] }
+            }),
+        );
+        assert_eq!(tool_json(&dry)["count"].as_u64(), Some(2));
+
+        let blocked = request(
+            &server,
+            2,
+            "tools/call",
+            json!({
+                "name": "documents_delete_where",
+                "arguments": { "collection": "docs", "dry_run": false, "filters": [{ "field": "n", "op": "gte", "value": 1 }] }
+            }),
+        );
+        assert_eq!(blocked["result"]["isError"].as_bool(), Some(true));
+
+        let compact = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "compact", "arguments": {} }),
+        );
+        let compact = tool_json(&compact);
+        let job_id = compact["job_id"].as_str().unwrap().to_string();
+
+        let mut state = String::from("queued");
+        for _ in 0..40 {
+            let job = request(
+                &server,
+                4,
+                "tools/call",
+                json!({ "name": "job_get", "arguments": { "id": job_id } }),
+            );
+            state = tool_json(&job)["state"].as_str().unwrap().to_string();
+            if state == "succeeded" || state == "failed" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(state, "succeeded");
+
+        let cancel = request(
+            &server,
+            5,
+            "tools/call",
+            json!({ "name": "job_cancel", "arguments": { "id": job_id } }),
+        );
+        assert_eq!(cancel["result"]["isError"].as_bool(), Some(true));
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn subscriptions_require_allowlist() {
+        let config = ServerConfig {
+            subscribe_to: vec!["control".to_string()],
+            ..ServerConfig::default()
+        };
+        let (server, dir) = temp_server("subscribe", config);
+        initialize(&server);
+
+        let allowed = request(
+            &server,
+            1,
+            "resources/subscribe",
+            json!({ "uri": "hakodb://collections/control" }),
+        );
+        assert!(allowed["result"].is_object(), "{allowed}");
+
+        let denied = request(
+            &server,
+            2,
+            "resources/subscribe",
+            json!({ "uri": "hakodb://collections/other" }),
+        );
+        assert_eq!(denied["error"]["code"].as_i64(), Some(-32002));
+
+        let watch = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "watch_create", "arguments": { "collection": "control", "filters": [] } }),
+        );
+        assert!(watch["result"].get("isError").is_none(), "{watch}");
 
         drop(server);
         let _ = std::fs::remove_dir_all(dir);
