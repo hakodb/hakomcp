@@ -1,6 +1,6 @@
 [package]
 name = "hakomcp"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Thin MCP server for the HakoDB embedded document engine"
 license = "MIT"
