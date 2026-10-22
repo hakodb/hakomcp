@@ -38,6 +38,21 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  local-only:
+    name: local-only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy --no-default-features
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
   test:
     name: test (${{ matrix.os }})
     strategy:
