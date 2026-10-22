@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "cloud-sync")]
+use hakodb::cloud_sync::{CloudSync, CloudSyncMode};
 use hakodb::config::HakoConfig;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
@@ -13,6 +15,8 @@ use hakodb::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
 use hakodb::index::composite::definition::SortDirection;
 use hakodb::index::traverse::{TraverseDir, TraverseSpec};
 use hakodb::index::vector::{decode_f32s, distance, encode_f32s, Metric};
+#[cfg(feature = "net-sync")]
+use hakodb::net_sync::{DiscoveryMode, NetSyncer};
 use hakodb::query::filter::{Filter, Operator};
 use hakodb::query::plan::QueryPlan;
 use hakodb::query::query::{AggregateOp, Query};
@@ -116,6 +120,9 @@ impl Profile {
             }
             "job_cancel" | "compact" | "vacuum" | "flush" | "documents_delete_where" => {
                 matches!(self, Self::Admin)
+            }
+            "sync_start" | "sync_stop" | "sync_status" | "sync_peers" | "sync_versions" => {
+                matches!(self, Self::Sync | Self::Admin)
             }
             _ => false,
         }
@@ -355,6 +362,16 @@ struct Watch {
     matched: HashSet<String>,
 }
 
+enum SyncController {
+    #[cfg(feature = "net-sync")]
+    Mesh(Arc<NetSyncer>),
+    #[cfg(feature = "cloud-sync")]
+    Cloud(Arc<CloudSync>),
+    #[cfg(not(any(feature = "net-sync", feature = "cloud-sync")))]
+    #[allow(dead_code)]
+    Disabled,
+}
+
 struct Server {
     db: Arc<Hako>,
     config: ServerConfig,
@@ -366,6 +383,9 @@ struct Server {
     next_watch_id: AtomicU64,
     jobs: Arc<JobManager>,
     shutdown: Arc<AtomicBool>,
+    #[allow(dead_code)]
+    runtime: Option<tokio::runtime::Handle>,
+    sync: Arc<Mutex<Option<SyncController>>>,
 }
 
 impl Server {
@@ -373,6 +393,7 @@ impl Server {
         db: Arc<Hako>,
         config: ServerConfig,
         notifier: Option<tokio::sync::mpsc::Sender<JsonValue>>,
+        runtime: Option<tokio::runtime::Handle>,
     ) -> Self {
         if config.profile == Profile::Read {
             db.set_read_only(true);
@@ -388,6 +409,8 @@ impl Server {
             next_watch_id: AtomicU64::new(1),
             jobs: Arc::new(JobManager::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            runtime,
+            sync: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1088,6 +1111,65 @@ impl Server {
                 }
             }),
             json!({
+                "name": "sync_start",
+                "description": "Start engine-native mesh or cloud sync. Secrets come from the environment.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["mesh", "cloud_server", "cloud_client"] },
+                        "node_id": { "type": "string" },
+                        "room": { "type": "string" },
+                        "port": { "type": "integer", "minimum": 1 },
+                        "bind": { "type": "string" },
+                        "server_url": { "type": "string" },
+                        "static_peers": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "discovery": { "type": "string", "enum": ["mdns", "broadcast", "both", "off"] },
+                        "relay": { "type": "boolean" },
+                        "max_clients": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["mode", "node_id", "room"]
+                }
+            }),
+            json!({
+                "name": "sync_stop",
+                "description": "Stop the active sync controller.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "sync_status",
+                "description": "Return redacted sync status. Secrets are never included.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "sync_peers",
+                "description": "Return connected peer identities and mesh dial state.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }),
+            json!({
+                "name": "sync_versions",
+                "description": "Return the per-collection version map used by catch-up.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }),
+            json!({
                 "name": "server_status",
                 "description": "Return hakomcp version, engine, profile, limits, and subscription state.",
                 "inputSchema": {
@@ -1141,6 +1223,11 @@ impl Server {
                 | "documents_delete_where"
                 | "watch_create"
                 | "watch_delete"
+                | "sync_start"
+                | "sync_stop"
+                | "sync_status"
+                | "sync_peers"
+                | "sync_versions"
                 | "server_status"
         );
         if !known {
@@ -1185,6 +1272,11 @@ impl Server {
             "documents_delete_where" => self.tool_delete_where(&args),
             "watch_create" => self.tool_watch_create(&args),
             "watch_delete" => self.tool_watch_delete(&args),
+            "sync_start" => self.tool_sync_start(&args),
+            "sync_stop" => self.tool_sync_stop(),
+            "sync_status" => self.tool_sync_status(),
+            "sync_peers" => self.tool_sync_peers(),
+            "sync_versions" => self.tool_sync_versions(),
             "server_status" => self.tool_server_status(),
             _ => unreachable!("known tool handled above"),
         };
@@ -1747,6 +1839,272 @@ impl Server {
         Ok(json!({ "ok": true, "job_id": id }))
     }
 
+    fn require_network(&self) -> Result<()> {
+        if !self.config.allow_network {
+            bail!("--allow-network is required to start sync");
+        }
+        Ok(())
+    }
+
+    fn tool_sync_start(&self, args: &JsonValue) -> Result<JsonValue> {
+        self.require_network()?;
+        if self.sync.lock().unwrap().is_some() {
+            bail!("sync is already running; call sync_stop first");
+        }
+        let mode = required_str(args, "mode")?;
+        let node_id = required_str(args, "node_id")?;
+        let room = required_str(args, "room")?;
+        let room_key = secret_env("HAKOMCP_SYNC_ROOM_KEY")?;
+        match mode {
+            "mesh" => self.start_mesh(args, node_id, room, &room_key),
+            "cloud_server" => self.start_cloud_server(args, node_id, room, &room_key),
+            "cloud_client" => self.start_cloud_client(args, node_id, room, &room_key),
+            other => bail!("`mode` must be mesh, cloud_server, or cloud_client, got `{other}`"),
+        }
+    }
+
+    #[cfg(feature = "net-sync")]
+    fn start_mesh(
+        &self,
+        args: &JsonValue,
+        node_id: &str,
+        room: &str,
+        room_key: &str,
+    ) -> Result<JsonValue> {
+        let port = required_u32(args, "port")?;
+        if port == 0 || port > u16::MAX as u32 {
+            bail!("`port` must be between 1 and {}", u16::MAX);
+        }
+        let static_peers: Vec<String> = args
+            .get("static_peers")
+            .and_then(JsonValue::as_array)
+            .map(|peers| {
+                peers
+                    .iter()
+                    .map(|peer| {
+                        peer.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow!("`static_peers` entries must be strings"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let discovery = match opt_str(args, "discovery")?.unwrap_or("mdns") {
+            "mdns" => DiscoveryMode::Mdns,
+            "broadcast" => DiscoveryMode::Broadcast,
+            "both" => DiscoveryMode::Both,
+            "off" => DiscoveryMode::Off,
+            other => bail!("`discovery` must be mdns, broadcast, both, or off, got `{other}`"),
+        };
+        let relay = args
+            .get("relay")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+
+        let handle = self
+            .runtime
+            .clone()
+            .ok_or_else(|| anyhow!("no async runtime available"))?;
+        let syncer = Arc::new(
+            NetSyncer::new(self.db.clone(), node_id, room_key, Vec::new())
+                .with_static_peers(static_peers)
+                .with_relay(relay)
+                .with_discovery(discovery),
+        );
+        *self.sync.lock().unwrap() = Some(SyncController::Mesh(syncer.clone()));
+        handle.spawn(async move {
+            if let Err(error) = syncer.start(port as u16).await {
+                eprintln!("[hakomcp] mesh sync failed: {error}");
+            }
+        });
+        Ok(json!({ "ok": true, "mode": "mesh", "room": room, "port": port }))
+    }
+
+    #[cfg(not(feature = "net-sync"))]
+    fn start_mesh(
+        &self,
+        _args: &JsonValue,
+        _node_id: &str,
+        _room: &str,
+        _room_key: &str,
+    ) -> Result<JsonValue> {
+        bail!("this build was compiled without the net-sync feature")
+    }
+
+    #[cfg(feature = "cloud-sync")]
+    fn start_cloud_server(
+        &self,
+        args: &JsonValue,
+        node_id: &str,
+        room: &str,
+        room_key: &str,
+    ) -> Result<JsonValue> {
+        let bind = required_str(args, "bind")?;
+        let auth_token = secret_env("HAKOMCP_CLOUD_AUTH_TOKEN")?;
+        let handle = self
+            .runtime
+            .clone()
+            .ok_or_else(|| anyhow!("no async runtime available"))?;
+        let controller = Arc::new(CloudSync::server(
+            self.db.clone(),
+            node_id,
+            &auth_token,
+            room,
+            room_key,
+        ));
+        controller.set_max_clients_per_room(opt_usize(args, "max_clients", 0)?);
+        *self.sync.lock().unwrap() = Some(SyncController::Cloud(controller.clone()));
+        let start_bind = bind.to_string();
+        let reported_bind = bind.to_string();
+        handle.spawn(async move {
+            if let Err(error) = controller.start(&start_bind).await {
+                eprintln!("[hakomcp] cloud server sync failed: {error}");
+            }
+        });
+        Ok(json!({ "ok": true, "mode": "cloud_server", "room": room, "bind": reported_bind }))
+    }
+
+    #[cfg(not(feature = "cloud-sync"))]
+    fn start_cloud_server(
+        &self,
+        _args: &JsonValue,
+        _node_id: &str,
+        _room: &str,
+        _room_key: &str,
+    ) -> Result<JsonValue> {
+        bail!("this build was compiled without the cloud-sync feature")
+    }
+
+    #[cfg(feature = "cloud-sync")]
+    fn start_cloud_client(
+        &self,
+        args: &JsonValue,
+        node_id: &str,
+        room: &str,
+        room_key: &str,
+    ) -> Result<JsonValue> {
+        let server_url = required_str(args, "server_url")?;
+        let auth_token = secret_env("HAKOMCP_CLOUD_AUTH_TOKEN")?;
+        let handle = self
+            .runtime
+            .clone()
+            .ok_or_else(|| anyhow!("no async runtime available"))?;
+        let controller = Arc::new(CloudSync::client(
+            self.db.clone(),
+            node_id,
+            room,
+            room_key,
+            &auth_token,
+        ));
+        if let Ok(api_key) = std::env::var("HAKOMCP_CLOUD_API_KEY") {
+            if !api_key.is_empty() {
+                controller.set_api_key(Some(api_key));
+            }
+        }
+        *self.sync.lock().unwrap() = Some(SyncController::Cloud(controller.clone()));
+        let start_url = server_url.to_string();
+        let reported_url = server_url.to_string();
+        handle.spawn(async move {
+            if let Err(error) = controller.start(&start_url).await {
+                eprintln!("[hakomcp] cloud client sync failed: {error}");
+            }
+        });
+        Ok(json!({ "ok": true, "mode": "cloud_client", "room": room, "server_url": reported_url }))
+    }
+
+    #[cfg(not(feature = "cloud-sync"))]
+    fn start_cloud_client(
+        &self,
+        _args: &JsonValue,
+        _node_id: &str,
+        _room: &str,
+        _room_key: &str,
+    ) -> Result<JsonValue> {
+        bail!("this build was compiled without the cloud-sync feature")
+    }
+
+    fn tool_sync_stop(&self) -> Result<JsonValue> {
+        let controller = self.sync.lock().unwrap().take();
+        match controller {
+            Some(controller) => {
+                stop_sync_controller(&controller);
+                Ok(json!({ "ok": true, "active": false }))
+            }
+            None => Ok(json!({ "ok": true, "active": false })),
+        }
+    }
+
+    fn tool_sync_status(&self) -> Result<JsonValue> {
+        let guard = self.sync.lock().unwrap();
+        let Some(controller) = guard.as_ref() else {
+            return Ok(json!({ "active": false }));
+        };
+        match controller {
+            #[cfg(feature = "net-sync")]
+            SyncController::Mesh(syncer) => {
+                let mut value =
+                    serde_json::to_value(syncer.status()).map_err(|error| anyhow!(error))?;
+                value["active"] = json!(true);
+                value["mode"] = json!("mesh");
+                value["dial"] = serde_json::to_value(syncer.mesh_dial_status())
+                    .map_err(|error| anyhow!(error))?;
+                Ok(value)
+            }
+            #[cfg(feature = "cloud-sync")]
+            SyncController::Cloud(cloud) => {
+                let status = cloud.status();
+                let mode = match status.mode {
+                    CloudSyncMode::Server => "cloud_server",
+                    CloudSyncMode::Client => "cloud_client",
+                };
+                Ok(json!({
+                    "active": true,
+                    "mode": mode,
+                    "connected": status.connected,
+                    "room_name": status.room_name,
+                    "active_clients": status.active_clients,
+                    "queued_writes": status.queued_writes,
+                    "peers": cloud.peer_list().len()
+                }))
+            }
+            #[cfg(not(any(feature = "net-sync", feature = "cloud-sync")))]
+            SyncController::Disabled => Ok(json!({ "active": false, "compiled": false })),
+        }
+    }
+
+    fn tool_sync_peers(&self) -> Result<JsonValue> {
+        let guard = self.sync.lock().unwrap();
+        let Some(controller) = guard.as_ref() else {
+            return Ok(json!({ "active": false, "peers": [] }));
+        };
+        match controller {
+            #[cfg(feature = "net-sync")]
+            SyncController::Mesh(syncer) => Ok(json!({
+                "active": true,
+                "mode": "mesh",
+                "status": serde_json::to_value(syncer.status()).map_err(|error| anyhow!(error))?,
+                "dial": serde_json::to_value(syncer.mesh_dial_status())
+                    .map_err(|error| anyhow!(error))?
+            })),
+            #[cfg(feature = "cloud-sync")]
+            SyncController::Cloud(cloud) => {
+                let peers: Vec<String> = cloud
+                    .peer_list()
+                    .into_iter()
+                    .map(|peer| peer.peer_key)
+                    .collect();
+                Ok(json!({ "active": true, "mode": "cloud", "peers": peers }))
+            }
+            #[cfg(not(any(feature = "net-sync", feature = "cloud-sync")))]
+            SyncController::Disabled => Ok(json!({ "active": false, "peers": [] })),
+        }
+    }
+
+    fn tool_sync_versions(&self) -> Result<JsonValue> {
+        Ok(json!({ "versions": self.db.get_version_map() }))
+    }
+
     fn tool_find_near(&self, args: &JsonValue) -> Result<JsonValue> {
         let collection = required_str(args, "collection")?;
         self.ensure_collection(collection)?;
@@ -1845,6 +2203,7 @@ impl Server {
             },
             "watches": self.watches.lock().unwrap().len(),
             "jobs": self.jobs.list().len(),
+            "sync": { "active": self.sync.lock().unwrap().is_some() },
             "network": { "enabled": self.config.allow_network },
             "destructive": { "enabled": self.config.allow_destructive }
         }))
@@ -1899,6 +2258,24 @@ impl Server {
             "uri": "hakodb://server/jobs",
             "name": "jobs",
             "description": "Recent background jobs",
+            "mimeType": "application/json"
+        }));
+        resources.push(json!({
+            "uri": "hakodb://sync/status",
+            "name": "sync status",
+            "description": "Redacted mesh or cloud sync status",
+            "mimeType": "application/json"
+        }));
+        resources.push(json!({
+            "uri": "hakodb://sync/peers",
+            "name": "sync peers",
+            "description": "Connected sync peers and dial state",
+            "mimeType": "application/json"
+        }));
+        resources.push(json!({
+            "uri": "hakodb://sync/versions",
+            "name": "sync versions",
+            "description": "Per-collection version map for catch-up",
             "mimeType": "application/json"
         }));
         for watch in self.watches.lock().unwrap().values() {
@@ -1959,6 +2336,18 @@ impl Server {
                 "collection": watch.collection,
                 "matched": watch.matched.len()
             });
+            return self.resource_json(uri, &value);
+        }
+        if uri == "hakodb://sync/status" {
+            let value = self.tool_sync_status().map_err(RpcError::internal)?;
+            return self.resource_json(uri, &value);
+        }
+        if uri == "hakodb://sync/peers" {
+            let value = self.tool_sync_peers().map_err(RpcError::internal)?;
+            return self.resource_json(uri, &value);
+        }
+        if uri == "hakodb://sync/versions" {
+            let value = self.tool_sync_versions().map_err(RpcError::internal)?;
             return self.resource_json(uri, &value);
         }
 
@@ -2390,6 +2779,25 @@ fn change_kind(kind: &ChangeKind) -> &'static str {
     }
 }
 
+fn secret_env(name: &str) -> Result<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => bail!("secret `{name}` is empty"),
+        Err(_) => bail!("missing secret `{name}`; set it in the environment"),
+    }
+}
+
+fn stop_sync_controller(controller: &SyncController) {
+    match controller {
+        #[cfg(feature = "net-sync")]
+        SyncController::Mesh(syncer) => syncer.stop(),
+        #[cfg(feature = "cloud-sync")]
+        SyncController::Cloud(cloud) => cloud.stop(),
+        #[cfg(not(any(feature = "net-sync", feature = "cloud-sync")))]
+        SyncController::Disabled => {}
+    }
+}
+
 fn watcher_loop(
     receiver: std::sync::mpsc::Receiver<ChangeEvent>,
     db: Arc<Hako>,
@@ -2633,6 +3041,11 @@ fn print_help() {
     println!("  --log-format FORMAT        text | json (default: text)");
     println!("  -h, --help                 show this help");
     println!("  -V, --version");
+    println!();
+    println!("Sync secrets are read from the environment, never from tool arguments:");
+    println!("  HAKOMCP_SYNC_ROOM_KEY      mesh and cloud room key");
+    println!("  HAKOMCP_CLOUD_AUTH_TOKEN   cloud server or client auth token");
+    println!("  HAKOMCP_CLOUD_API_KEY      optional cloud client group API key");
 }
 
 #[tokio::main]
@@ -2651,7 +3064,12 @@ async fn run() -> Result<()> {
     );
     let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<String>(64);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<JsonValue>(64);
-    let server = Arc::new(Server::new(db, cli.config.clone(), Some(out_tx.clone())));
+    let server = Arc::new(Server::new(
+        db,
+        cli.config.clone(),
+        Some(out_tx.clone()),
+        Some(tokio::runtime::Handle::current()),
+    ));
     server.log(&format!("database {}", cli.db.display()));
     server.log(&format!("profile {}", cli.config.profile.as_str()));
 
@@ -2724,7 +3142,7 @@ mod tests {
             std::env::temp_dir().join(format!("hakomcp-{tag}-{}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let db = Arc::new(Hako::open(&dir, HakoConfig::default()).unwrap());
-        (Arc::new(Server::new(db, config, None)), dir)
+        (Arc::new(Server::new(db, config, None, None)), dir)
     }
 
     fn request(server: &Server, id: u64, method: &str, params: JsonValue) -> JsonValue {
@@ -3488,6 +3906,76 @@ mod tests {
         let (server, dir) = temp_server("lifecycle", ServerConfig::default());
         let call = request(&server, 1, "tools/list", json!({}));
         assert_eq!(call["error"]["code"].as_i64(), Some(-32002));
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sync_start_requires_network_permission() {
+        let config = ServerConfig {
+            profile: Profile::Admin,
+            ..ServerConfig::default()
+        };
+        let (server, dir) = temp_server("sync-network", config);
+        initialize(&server);
+        let start = request(
+            &server,
+            1,
+            "tools/call",
+            json!({
+                "name": "sync_start",
+                "arguments": { "mode": "mesh", "node_id": "a", "room": "r", "port": 7001 }
+            }),
+        );
+        assert_eq!(start["result"]["isError"].as_bool(), Some(true), "{start}");
+        assert!(start["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("--allow-network"));
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sync_status_is_inactive_and_secret_free_without_a_controller() {
+        let config = ServerConfig {
+            profile: Profile::Sync,
+            allow_network: true,
+            ..ServerConfig::default()
+        };
+        let (server, dir) = temp_server("sync-status", config);
+        initialize(&server);
+
+        let status = request(
+            &server,
+            1,
+            "tools/call",
+            json!({ "name": "sync_status", "arguments": {} }),
+        );
+        let status = tool_json(&status);
+        assert_eq!(status["active"], false);
+        assert!(status.get("room_key").is_none());
+        assert!(status.get("auth_token").is_none());
+
+        let read = request(
+            &server,
+            2,
+            "resources/read",
+            json!({ "uri": "hakodb://sync/status" }),
+        );
+        let payload: JsonValue =
+            serde_json::from_str(read["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["active"], false);
+        assert!(payload.get("room_key").is_none());
+
+        let stop = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "sync_stop", "arguments": {} }),
+        );
+        assert_eq!(tool_json(&stop)["active"], false);
+
         drop(server);
         let _ = std::fs::remove_dir_all(dir);
     }
