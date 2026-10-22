@@ -2102,7 +2102,13 @@ impl Server {
     }
 
     fn tool_sync_versions(&self) -> Result<JsonValue> {
-        Ok(json!({ "versions": self.db.get_version_map() }))
+        let versions: std::collections::HashMap<String, i64> = self
+            .db
+            .get_version_map()
+            .into_iter()
+            .filter(|(collection, _)| self.config.collection_allowed(collection))
+            .collect();
+        Ok(json!({ "versions": versions }))
     }
 
     fn tool_find_near(&self, args: &JsonValue) -> Result<JsonValue> {
@@ -2260,24 +2266,26 @@ impl Server {
             "description": "Recent background jobs",
             "mimeType": "application/json"
         }));
-        resources.push(json!({
-            "uri": "hakodb://sync/status",
-            "name": "sync status",
-            "description": "Redacted mesh or cloud sync status",
-            "mimeType": "application/json"
-        }));
-        resources.push(json!({
-            "uri": "hakodb://sync/peers",
-            "name": "sync peers",
-            "description": "Connected sync peers and dial state",
-            "mimeType": "application/json"
-        }));
-        resources.push(json!({
-            "uri": "hakodb://sync/versions",
-            "name": "sync versions",
-            "description": "Per-collection version map for catch-up",
-            "mimeType": "application/json"
-        }));
+        if self.config.profile.allows_tool("sync_status") {
+            resources.push(json!({
+                "uri": "hakodb://sync/status",
+                "name": "sync status",
+                "description": "Redacted mesh or cloud sync status",
+                "mimeType": "application/json"
+            }));
+            resources.push(json!({
+                "uri": "hakodb://sync/peers",
+                "name": "sync peers",
+                "description": "Connected sync peers and dial state",
+                "mimeType": "application/json"
+            }));
+            resources.push(json!({
+                "uri": "hakodb://sync/versions",
+                "name": "sync versions",
+                "description": "Per-collection version map for catch-up",
+                "mimeType": "application/json"
+            }));
+        }
         for watch in self.watches.lock().unwrap().values() {
             resources.push(json!({
                 "uri": format!("hakodb://watches/{}", watch.id),
@@ -2338,16 +2346,17 @@ impl Server {
             });
             return self.resource_json(uri, &value);
         }
-        if uri == "hakodb://sync/status" {
-            let value = self.tool_sync_status().map_err(RpcError::internal)?;
-            return self.resource_json(uri, &value);
-        }
-        if uri == "hakodb://sync/peers" {
-            let value = self.tool_sync_peers().map_err(RpcError::internal)?;
-            return self.resource_json(uri, &value);
-        }
-        if uri == "hakodb://sync/versions" {
-            let value = self.tool_sync_versions().map_err(RpcError::internal)?;
+        if uri.starts_with("hakodb://sync/") {
+            if !self.config.profile.allows_tool("sync_status") {
+                return Err(RpcError::resource_not_found(uri));
+            }
+            let value = match uri {
+                "hakodb://sync/status" => self.tool_sync_status(),
+                "hakodb://sync/peers" => self.tool_sync_peers(),
+                "hakodb://sync/versions" => self.tool_sync_versions(),
+                _ => return Err(RpcError::resource_not_found(uri)),
+            }
+            .map_err(RpcError::internal)?;
             return self.resource_json(uri, &value);
         }
 
@@ -3132,6 +3141,7 @@ async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn temp_server(tag: &str, config: ServerConfig) -> (Arc<Server>, PathBuf) {
         let nanos = SystemTime::now()
@@ -3344,6 +3354,50 @@ mod tests {
             }),
         );
         assert_eq!(call["error"]["code"].as_i64(), Some(-32602));
+
+        let resources = request(&server, 3, "resources/list", json!({}));
+        assert!(!resources["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resource| resource["uri"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("hakodb://sync/")));
+
+        let sync = request(
+            &server,
+            4,
+            "resources/read",
+            json!({ "uri": "hakodb://sync/versions" }),
+        );
+        assert_eq!(sync["error"]["code"].as_i64(), Some(-32002));
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sync_versions_respect_collection_policy() {
+        let config = ServerConfig {
+            profile: Profile::Sync,
+            allow_network: true,
+            collection_deny: vec!["blocked".to_string()],
+            ..ServerConfig::default()
+        };
+        let (server, dir) = temp_server("sync-policy", config);
+        initialize(&server);
+        server.db.put("allowed", "a1", &HakoDoc::default()).unwrap();
+        server.db.put("blocked", "b1", &HakoDoc::default()).unwrap();
+
+        let versions = tool_json(&request(
+            &server,
+            1,
+            "tools/call",
+            json!({ "name": "sync_versions", "arguments": {} }),
+        ));
+        assert!(versions["versions"]["allowed"].is_number());
+        assert!(versions["versions"].get("blocked").is_none());
 
         drop(server);
         let _ = std::fs::remove_dir_all(dir);
@@ -3896,6 +3950,104 @@ mod tests {
             json!({ "name": "watch_create", "arguments": { "collection": "control", "filters": [] } }),
         );
         assert!(watch["result"].get("isError").is_none(), "{watch}");
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[ignore = "manual baseline; run with --release --ignored --nocapture"]
+    fn performance_baseline() {
+        let (server, dir) = temp_server("perf", ServerConfig::default());
+        initialize(&server);
+
+        let mutations: Vec<JsonValue> = (0..1000)
+            .map(|index| {
+                json!({
+                    "op": "put",
+                    "collection": "bench",
+                    "id": format!("b{index}"),
+                    "doc": { "n": index, "body": "x".repeat(256) }
+                })
+            })
+            .collect();
+        let started = Instant::now();
+        request(
+            &server,
+            1,
+            "tools/call",
+            json!({ "name": "document_batch", "arguments": { "mutations": mutations } }),
+        );
+        eprintln!("batch put 1000: {:?}", started.elapsed());
+
+        let started = Instant::now();
+        for id in 0..1000 {
+            request(
+                &server,
+                2 + id,
+                "tools/call",
+                json!({ "name": "document_get", "arguments": { "collection": "bench", "id": format!("b{id}") } }),
+            );
+        }
+        eprintln!("get 1000: {:?}", started.elapsed());
+
+        let started = Instant::now();
+        request(
+            &server,
+            2000,
+            "resources/read",
+            json!({ "uri": "hakodb://collections/bench" }),
+        );
+        eprintln!("resource sample: {:?}", started.elapsed());
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_tool_calls_stay_consistent() {
+        let (server, dir) = temp_server("concurrent", ServerConfig::default());
+        initialize(&server);
+
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            let server = server.clone();
+            workers.push(std::thread::spawn(move || {
+                for index in 0..25 {
+                    let id = worker * 25 + index;
+                    let response = server
+                        .handle(&json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "document_put",
+                                "arguments": {
+                                    "collection": "notes",
+                                    "id": format!("n{id}"),
+                                    "doc": { "worker": worker, "index": index }
+                                }
+                            }
+                        }))
+                        .unwrap();
+                    assert!(response["result"].get("isError").is_none(), "{response}");
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let query = tool_json(&request(
+            &server,
+            100,
+            "tools/call",
+            json!({
+                "name": "query",
+                "arguments": { "collection": "notes", "limit": 200 }
+            }),
+        ));
+        assert_eq!(query["count"], 100);
 
         drop(server);
         let _ = std::fs::remove_dir_all(dir);

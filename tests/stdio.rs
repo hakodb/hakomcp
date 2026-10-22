@@ -67,6 +67,35 @@ impl Client {
         drop(self.stdin);
         let _ = self.child.wait();
     }
+
+    fn kill(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn call(&mut self, id: u64, name: &str, arguments: JsonValue) -> JsonValue {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }));
+        self.read_response(id)
+    }
+
+    fn initialize(&mut self) {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "stdio-test", "version": "1" }
+            }
+        }));
+        assert!(self.read_response(1)["result"].is_object());
+    }
 }
 
 #[test]
@@ -261,5 +290,72 @@ fn stdio_subscriptions_are_disabled_without_allowlist() {
     assert_eq!(subscribe["error"]["code"].as_i64(), Some(-32602));
 
     client.close();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn restart_recovers_documents_after_a_hard_kill() {
+    let dir = temp_dir("restart");
+    let db = dir.to_string_lossy().to_string();
+
+    let mut first = Client::spawn(&["--db", &db, "--profile", "admin"]);
+    first.initialize();
+    let put = first.call(
+        2,
+        "document_put",
+        json!({ "collection": "notes", "id": "n1", "doc": { "title": "durable" } }),
+    );
+    assert!(put["result"].get("isError").is_none(), "{put}");
+    let flush = first.call(3, "flush", json!({}));
+    assert!(flush["result"].get("isError").is_none(), "{flush}");
+    first.kill();
+
+    let mut second = Client::spawn(&["--db", &db]);
+    second.initialize();
+    let get = second.call(
+        2,
+        "document_get",
+        json!({ "collection": "notes", "id": "n1" }),
+    );
+    let text = get["result"]["content"][0]["text"].as_str().unwrap();
+    let value: JsonValue = serde_json::from_str(text).unwrap();
+    assert_eq!(value["document"]["title"], "durable");
+
+    second.close();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn large_results_are_capped_and_raiseable() {
+    let dir = temp_dir("large");
+    let db = dir.to_string_lossy().to_string();
+    let payload = "x".repeat(1_500_000);
+
+    let mut capped = Client::spawn(&["--db", &db]);
+    capped.initialize();
+    let put = capped.call(
+        2,
+        "document_put",
+        json!({ "collection": "notes", "id": "big", "doc": { "body": payload } }),
+    );
+    assert!(put["result"].get("isError").is_none(), "{put}");
+    let get = capped.call(
+        3,
+        "document_get",
+        json!({ "collection": "notes", "id": "big" }),
+    );
+    assert_eq!(get["result"]["isError"], true, "{get}");
+    capped.close();
+
+    let mut raised = Client::spawn(&["--db", &db, "--max-result-bytes", "2097152"]);
+    raised.initialize();
+    let get = raised.call(
+        2,
+        "document_get",
+        json!({ "collection": "notes", "id": "big" }),
+    );
+    assert!(get["result"].get("isError").is_none(), "{get}");
+
+    raised.close();
     let _ = std::fs::remove_dir_all(dir);
 }
