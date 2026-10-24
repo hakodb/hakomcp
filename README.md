@@ -11,6 +11,7 @@ No engine changes: this is a JSON adapter over the public `hakodb` crate.
 | hakomcp | hako core |
 |---|---|
 | 0.1.0 | `hakodb 0.16+` (crates.io) |
+| 0.2.0 | `hakodb 0.19+` (`min`/`max` aggregates, `document_exists`, per-collection `compact`, serialized stats) |
 
 ## Build
 
@@ -46,8 +47,11 @@ Example MCP client entry:
 | Tool | Arguments | Result |
 |---|---|---|
 | `get` | `collection`, `id` | `{found, document}` |
+| `document_exists` | `collection`, `id` | `{collection, id, exists}` |
 | `put` | `collection`, `doc`, `id?`, `vectors?` | `{ok, collection, id}` |
 | `query` | `collection`, `filters?`, `any?`, `order_by?`, `limit?`, `offset?`, `select?` | `{collection, count, documents}` |
+| `aggregate` | `collection`, `op`, `filters?`, `any?`, `field?` | `{collection, op, results}` |
+| `compact` | `collection?` | `{ok, job_id}` |
 | `create_index` | `collection`, `field`, `kind`, `dim?`, `metric?` | `{ok, collection, field, kind}` |
 | `find_near` | `collection`, `field`, `vector`, `k?` | `{collection, field, count, hits}` |
 | `find_paths` | `collection`, `id`, `direction?`, `edge_field?`, `max_depth?`, `limit?`, `via_edge?`, `weight_field?` | `{collection, id, count, hits}` |

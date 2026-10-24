@@ -10,7 +10,6 @@ use hakodb::cloud_sync::{CloudSync, CloudSyncMode};
 use hakodb::config::HakoConfig;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
-use hakodb::engine::engine::CollectionStats;
 use hakodb::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
 use hakodb::index::composite::definition::SortDirection;
 use hakodb::index::traverse::{TraverseDir, TraverseSpec};
@@ -100,6 +99,7 @@ impl Profile {
     fn allows_tool(self, name: &str) -> bool {
         match name {
             "document_get"
+            | "document_exists"
             | "query"
             | "find_near"
             | "find_paths"
@@ -520,6 +520,18 @@ impl Server {
                 }
             }),
             json!({
+                "name": "document_exists",
+                "description": "Cheap existence probe: pins and validates the stored row without decoding it. Never creates the collection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "id": { "type": "string" }
+                    },
+                    "required": ["collection", "id"]
+                }
+            }),
+            json!({
                 "name": "document_put",
                 "description": "Insert or replace a document. Fields hold ordinary JSON values; `vectors` holds vector-index fields (LE f32 arrays) and overrides same-named doc fields. Legacy alias: `put`.",
                 "inputSchema": {
@@ -802,7 +814,7 @@ impl Server {
             }),
             json!({
                 "name": "aggregate",
-                "description": "Run count, sum, or avg over a collection query.",
+                "description": "Run count, sum, avg, min, or max over a collection query. min/max skip non-numeric values and omit the result key when nothing matches.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -829,7 +841,7 @@ impl Server {
                                 "required": ["field", "filters"]
                             }
                         },
-                        "op": { "type": "string", "enum": ["count", "sum", "avg"] },
+                        "op": { "type": "string", "enum": ["count", "sum", "avg", "min", "max"] },
                         "field": { "type": "string" }
                     },
                     "required": ["collection", "op"],
@@ -967,10 +979,12 @@ impl Server {
             }),
             json!({
                 "name": "compact",
-                "description": "Start a background full-database compaction job.",
+                "description": "Start a background compaction job: full database, or one resident collection when `collection` is given.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "collection": { "type": "string" }
+                    },
                     "additionalProperties": false
                 }
             }),
@@ -1198,6 +1212,7 @@ impl Server {
         let known = matches!(
             name,
             "document_get"
+                | "document_exists"
                 | "document_put"
                 | "document_patch"
                 | "document_delete"
@@ -1247,6 +1262,7 @@ impl Server {
 
         let result = match name {
             "document_get" => self.tool_get(&args),
+            "document_exists" => self.tool_exists(&args),
             "document_put" => self.tool_put(&args),
             "document_patch" => self.tool_patch(&args),
             "document_delete" => self.tool_delete(&args),
@@ -1266,7 +1282,7 @@ impl Server {
             "job_list" => self.tool_job_list(),
             "job_get" => self.tool_job_get(&args),
             "job_cancel" => self.tool_job_cancel(&args),
-            "compact" => self.tool_compact(),
+            "compact" => self.tool_compact(&args),
             "vacuum" => self.tool_vacuum(&args),
             "flush" => self.tool_flush(),
             "documents_delete_where" => self.tool_delete_where(&args),
@@ -1306,6 +1322,14 @@ impl Server {
             }),
             None => json!({ "found": false, "document": null }),
         })
+    }
+
+    fn tool_exists(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        let id = required_str(args, "id")?;
+        let exists = self.db.exists(collection, id)?;
+        Ok(json!({ "collection": collection, "id": id, "exists": exists }))
     }
 
     fn tool_put(&self, args: &JsonValue) -> Result<JsonValue> {
@@ -1422,7 +1446,8 @@ impl Server {
             .map_err(|error| anyhow!(error))?;
         let indexes = serde_json::to_value(self.db.list_indexes(Some(collection)))
             .map_err(|error| anyhow!(error))?;
-        let stats = stats_to_json(&self.db.collection_stats(collection)?);
+        let stats = serde_json::to_value(self.db.collection_stats(collection)?)
+            .map_err(|error| anyhow!(error))?;
         Ok(json!({
             "collection": collection,
             "schema": schema,
@@ -1435,7 +1460,8 @@ impl Server {
         let collection = required_str(args, "collection")?;
         self.ensure_collection(collection)?;
         self.ensure_collection_exists(collection)?;
-        let stats = stats_to_json(&self.db.collection_stats(collection)?);
+        let stats = serde_json::to_value(self.db.collection_stats(collection)?)
+            .map_err(|error| anyhow!(error))?;
         Ok(json!({ "collection": collection, "stats": stats }))
     }
 
@@ -1508,7 +1534,9 @@ impl Server {
             "count" => query.aggregate(AggregateOp::Count),
             "sum" => query.aggregate(AggregateOp::Sum(required_str(args, "field")?.to_string())),
             "avg" => query.aggregate(AggregateOp::Avg(required_str(args, "field")?.to_string())),
-            other => bail!("`op` must be count, sum, or avg, got `{other}`"),
+            "min" => query.aggregate(AggregateOp::Min(required_str(args, "field")?.to_string())),
+            "max" => query.aggregate(AggregateOp::Max(required_str(args, "field")?.to_string())),
+            other => bail!("`op` must be count, sum, avg, min, or max, got `{other}`"),
         };
         let results = self.db.execute_aggregation(query)?;
         Ok(json!({ "collection": collection, "op": op, "results": results }))
@@ -1749,14 +1777,22 @@ impl Server {
         Ok(json!({ "ok": true, "id": id }))
     }
 
-    fn tool_compact(&self) -> Result<JsonValue> {
+    fn tool_compact(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = opt_str(args, "collection")?.map(str::to_string);
+        if let Some(collection) = &collection {
+            self.ensure_collection(collection)?;
+        }
         let id = self.jobs.create("compact", false);
         let jobs = self.jobs.clone();
         let db = self.db.clone();
         let job_id = id.clone();
         std::thread::spawn(move || {
             jobs.start(&job_id);
-            match db.compact() {
+            let result = match &collection {
+                Some(collection) => db.compact_collection(collection),
+                None => db.compact(),
+            };
+            match result {
                 Ok(()) => jobs.succeed(&job_id, json!({ "ok": true })),
                 Err(error) => jobs.fail(&job_id, error.to_string()),
             }
@@ -2392,12 +2428,12 @@ impl Server {
                     .unwrap_or(JsonValue::Null),
                 "indexes" => serde_json::to_value(self.db.list_indexes(Some(collection)))
                     .map_err(RpcError::internal)?,
-                "stats" => stats_to_json(
-                    &self
-                        .db
+                "stats" => serde_json::to_value(
+                    self.db
                         .collection_stats(collection)
                         .map_err(RpcError::internal)?,
-                ),
+                )
+                .map_err(RpcError::internal)?,
                 _ => unreachable!("kind filtered above"),
             };
             let text = serde_json::to_string_pretty(&value).map_err(RpcError::internal)?;
@@ -2694,20 +2730,6 @@ fn filter_index_map(value: &mut JsonValue, key: &str, allowed: &dyn Fn(&str) -> 
     if let Some(map) = value.get_mut(key).and_then(JsonValue::as_object_mut) {
         map.retain(|name, _| allowed(name.as_str()));
     }
-}
-
-fn stats_to_json(stats: &CollectionStats) -> JsonValue {
-    json!({
-        "collection": stats.collection,
-        "doc_count": stats.doc_count,
-        "live_bytes": stats.live_bytes,
-        "total_bytes": stats.total_bytes,
-        "segment_count": stats.segment_count,
-        "wal_bytes": stats.wal_bytes,
-        "blob_bytes": stats.blob_bytes,
-        "tombstone_count": stats.tombstone_count,
-        "unloaded": stats.unloaded
-    })
 }
 
 fn required_str<'a>(value: &'a JsonValue, key: &str) -> Result<&'a str> {
@@ -3717,9 +3739,49 @@ mod tests {
         );
         assert_eq!(tool_json(&avg)["results"]["avg_n"].as_f64(), Some(2.0));
 
-        let explain = request(
+        let min = request(
             &server,
             4,
+            "tools/call",
+            json!({ "name": "aggregate", "arguments": { "collection": "docs", "op": "min", "field": "n" } }),
+        );
+        assert_eq!(tool_json(&min)["results"]["min_n"].as_f64(), Some(1.0));
+
+        let max = request(
+            &server,
+            5,
+            "tools/call",
+            json!({ "name": "aggregate", "arguments": { "collection": "docs", "op": "max", "field": "n" } }),
+        );
+        assert_eq!(tool_json(&max)["results"]["max_n"].as_f64(), Some(3.0));
+
+        // Empty result: the core omits the key, so the map has no min_n.
+        let empty = request(
+            &server,
+            6,
+            "tools/call",
+            json!({ "name": "aggregate", "arguments": { "collection": "docs", "op": "min", "field": "missing" } }),
+        );
+        assert!(tool_json(&empty)["results"].get("min_missing").is_none());
+
+        let exists = request(
+            &server,
+            7,
+            "tools/call",
+            json!({ "name": "document_exists", "arguments": { "collection": "docs", "id": "d1" } }),
+        );
+        assert_eq!(tool_json(&exists)["exists"].as_bool(), Some(true));
+        let missing = request(
+            &server,
+            8,
+            "tools/call",
+            json!({ "name": "document_exists", "arguments": { "collection": "docs", "id": "nope" } }),
+        );
+        assert_eq!(tool_json(&missing)["exists"].as_bool(), Some(false));
+
+        let explain = request(
+            &server,
+            9,
             "tools/call",
             json!({ "name": "explain", "arguments": { "collection": "docs" } }),
         );
@@ -3905,6 +3967,30 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         assert_eq!(state, "succeeded");
+
+        // Per-collection compaction rides the same job surface.
+        let scoped = request(
+            &server,
+            5,
+            "tools/call",
+            json!({ "name": "compact", "arguments": { "collection": "docs" } }),
+        );
+        let scoped_job = tool_json(&scoped)["job_id"].as_str().unwrap().to_string();
+        let mut scoped_state = String::from("queued");
+        for _ in 0..40 {
+            let job = request(
+                &server,
+                6,
+                "tools/call",
+                json!({ "name": "job_get", "arguments": { "id": scoped_job } }),
+            );
+            scoped_state = tool_json(&job)["state"].as_str().unwrap().to_string();
+            if scoped_state == "succeeded" || scoped_state == "failed" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(scoped_state, "succeeded");
 
         let cancel = request(
             &server,
