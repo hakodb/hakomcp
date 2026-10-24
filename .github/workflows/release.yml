@@ -17,7 +17,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: hakomcp-linux-x86_64
+            artifact: hakomcp
             binary: hakomcp
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -25,7 +25,7 @@ jobs:
             binary: hakomcp
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: hakomcp-windows-x86_64.exe
+            artifact: hakomcp.exe
             binary: hakomcp.exe
     runs-on: ${{ matrix.os }}
     steps:
@@ -40,10 +40,17 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --target ${{ matrix.target }}
 
+      # Artifact names are the published asset names. Two targets both build
+      # a file called `hakomcp`, so copy to the distinct asset name first:
+      # upload-artifact would otherwise collapse them in the merged download.
+      - name: Collect binary
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.artifact }}"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: ${{ matrix.artifact }}
 
   release:
     name: publish
