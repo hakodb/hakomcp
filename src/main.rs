@@ -12,7 +12,6 @@ use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
 use hakodb::error::HakoError;
-use hakodb::CancelToken;
 use hakodb::index::composite::definition::SortDirection;
 use hakodb::index::traverse::{TraverseDir, TraverseSpec};
 use hakodb::index::vector::{decode_f32s, distance, encode_f32s, Metric};
@@ -22,6 +21,7 @@ use hakodb::query::filter::{Filter, Operator};
 use hakodb::query::plan::QueryPlan;
 use hakodb::query::query::{AggregateOp, Query};
 use hakodb::schema::CollectionSchema;
+use hakodb::CancelToken;
 use serde_json::{json, Value as JsonValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -3954,7 +3954,10 @@ mod tests {
         assert!(!token.is_cancelled());
 
         jobs.cancel(&id).expect("cancellable job cancels");
-        assert!(token.is_cancelled(), "job_cancel must flip the engine token");
+        assert!(
+            token.is_cancelled(),
+            "job_cancel must flip the engine token"
+        );
         assert_eq!(jobs.get(&id).unwrap().state, JobState::Cancelled);
 
         // The worker observes the error afterwards; that must not downgrade
