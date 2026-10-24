@@ -11,6 +11,8 @@ use hakodb::config::HakoConfig;
 use hakodb::document::hako_doc::HakoDoc;
 use hakodb::document::value::Value;
 use hakodb::engine::{BatchMutation, ChangeEvent, ChangeKind, Hako};
+use hakodb::error::HakoError;
+use hakodb::CancelToken;
 use hakodb::index::composite::definition::SortDirection;
 use hakodb::index::traverse::{TraverseDir, TraverseSpec};
 use hakodb::index::vector::{decode_f32s, distance, encode_f32s, Metric};
@@ -267,6 +269,9 @@ impl JobRecord {
 
 struct JobManager {
     jobs: Mutex<HashMap<String, JobRecord>>,
+    /// Cancellation flag per cancellable job; `job_cancel` flips it and the
+    /// worker hands it to the engine's `*_with_cancel` variants.
+    tokens: Mutex<HashMap<String, CancelToken>>,
     next_id: AtomicU64,
 }
 
@@ -274,6 +279,7 @@ impl JobManager {
     fn new() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -293,7 +299,17 @@ impl JobManager {
             cancellable,
         };
         self.jobs.lock().unwrap().insert(id.clone(), record);
+        if cancellable {
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(id.clone(), CancelToken::new());
+        }
         id
+    }
+
+    fn token(&self, id: &str) -> Option<CancelToken> {
+        self.tokens.lock().unwrap().get(id).cloned()
     }
 
     fn start(&self, id: &str) {
@@ -316,6 +332,7 @@ impl JobManager {
             job.finished_at = Some(now_millis());
             job.result = Some(result);
         }
+        self.tokens.lock().unwrap().remove(id);
     }
 
     fn fail(&self, id: &str, error: String) {
@@ -324,6 +341,17 @@ impl JobManager {
             job.finished_at = Some(now_millis());
             job.error = Some(error);
         }
+        self.tokens.lock().unwrap().remove(id);
+    }
+
+    /// The worker saw [`HakoError::Cancelled`]; `job_cancel` already set the
+    /// state, so only stamp the finish time.
+    fn finish_cancelled(&self, id: &str) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+            job.state = JobState::Cancelled;
+            job.finished_at = Some(now_millis());
+        }
+        self.tokens.lock().unwrap().remove(id);
     }
 
     fn get(&self, id: &str) -> Option<JobRecord> {
@@ -346,6 +374,11 @@ impl JobManager {
         }
         match job.state {
             JobState::Queued | JobState::Running => {
+                // Flip the engine-side flag first: the worker may already be
+                // inside a `*_with_cancel` call.
+                if let Some(token) = self.tokens.lock().unwrap().get(id) {
+                    token.cancel();
+                }
                 job.state = JobState::Cancelled;
                 job.finished_at = Some(now_millis());
                 Ok(())
@@ -979,7 +1012,7 @@ impl Server {
             }),
             json!({
                 "name": "compact",
-                "description": "Start a background compaction job: full database, or one resident collection when `collection` is given.",
+                "description": "Start a cancelable background compaction job: full database, or one resident collection when `collection` is given.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -990,7 +1023,7 @@ impl Server {
             }),
             json!({
                 "name": "vacuum",
-                "description": "Start a background vacuum job for one collection or all allowed collections.",
+                "description": "Start a cancelable background vacuum job for one collection or all allowed collections.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1010,7 +1043,7 @@ impl Server {
             }),
             json!({
                 "name": "documents_delete_where",
-                "description": "Count or delete documents matching a query. Always dry-run first; deletion needs --allow-destructive.",
+                "description": "Count or delete documents matching a query. Always dry-run first; deletion needs --allow-destructive. A deletion run is a cancelable background job.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1782,18 +1815,20 @@ impl Server {
         if let Some(collection) = &collection {
             self.ensure_collection(collection)?;
         }
-        let id = self.jobs.create("compact", false);
+        let id = self.jobs.create("compact", true);
         let jobs = self.jobs.clone();
         let db = self.db.clone();
         let job_id = id.clone();
+        let token = jobs.token(&id).expect("cancellable job has a token");
         std::thread::spawn(move || {
             jobs.start(&job_id);
             let result = match &collection {
-                Some(collection) => db.compact_collection(collection),
-                None => db.compact(),
+                Some(collection) => db.compact_collection_with_cancel(collection, &token),
+                None => db.compact_with_cancel(&token),
             };
             match result {
                 Ok(()) => jobs.succeed(&job_id, json!({ "ok": true })),
+                Err(HakoError::Cancelled) => jobs.finish_cancelled(&job_id),
                 Err(error) => jobs.fail(&job_id, error.to_string()),
             }
         });
@@ -1817,16 +1852,25 @@ impl Server {
             bail!("no collections to vacuum");
         }
 
-        let id = self.jobs.create("vacuum", false);
+        let id = self.jobs.create("vacuum", true);
         let jobs = self.jobs.clone();
         let db = self.db.clone();
         let job_id = id.clone();
+        let token = jobs.token(&id).expect("cancellable job has a token");
         std::thread::spawn(move || {
             jobs.start(&job_id);
             let total = collections.len();
             for (index, collection) in collections.iter().enumerate() {
-                if let Err(error) = db.vacuum(collection) {
-                    jobs.fail(&job_id, error.to_string());
+                if token.is_cancelled() {
+                    jobs.finish_cancelled(&job_id);
+                    return;
+                }
+                if let Err(error) = db.vacuum_with_cancel(collection, &token) {
+                    if matches!(error, HakoError::Cancelled) {
+                        jobs.finish_cancelled(&job_id);
+                    } else {
+                        jobs.fail(&job_id, error.to_string());
+                    }
                     return;
                 }
                 jobs.progress(&job_id, (index + 1) as f64 / total as f64);
@@ -1861,14 +1905,16 @@ impl Server {
             bail!("actual deletion requires --allow-destructive");
         }
 
-        let id = self.jobs.create("documents_delete_where", false);
+        let id = self.jobs.create("documents_delete_where", true);
         let jobs = self.jobs.clone();
         let db = self.db.clone();
         let job_id = id.clone();
+        let token = jobs.token(&id).expect("cancellable job has a token");
         std::thread::spawn(move || {
             jobs.start(&job_id);
-            match db.delete_where(query) {
+            match db.delete_where_with_cancel(query, &token) {
                 Ok(deleted) => jobs.succeed(&job_id, json!({ "deleted": deleted })),
+                Err(HakoError::Cancelled) => jobs.finish_cancelled(&job_id),
                 Err(error) => jobs.fail(&job_id, error.to_string()),
             }
         });
@@ -3897,6 +3943,28 @@ mod tests {
 
         drop(server);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancel_flips_the_engine_token() {
+        let jobs = JobManager::new();
+        let id = jobs.create("vacuum", true);
+        let token = jobs.token(&id).expect("cancellable job has a token");
+        jobs.start(&id);
+        assert!(!token.is_cancelled());
+
+        jobs.cancel(&id).expect("cancellable job cancels");
+        assert!(token.is_cancelled(), "job_cancel must flip the engine token");
+        assert_eq!(jobs.get(&id).unwrap().state, JobState::Cancelled);
+
+        // The worker observes the error afterwards; that must not downgrade
+        // the job to `failed`, and the token must not leak.
+        jobs.finish_cancelled(&id);
+        assert_eq!(jobs.get(&id).unwrap().state, JobState::Cancelled);
+        assert!(jobs.token(&id).is_none(), "token dropped when the job ends");
+
+        let fixed = jobs.create("flush", false);
+        assert!(jobs.cancel(&fixed).is_err());
     }
 
     #[test]
