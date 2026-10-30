@@ -51,6 +51,11 @@ Example MCP client entry:
 | `put` | `collection`, `doc`, `id?`, `vectors?` | `{ok, collection, id}` |
 | `query` | `collection`, `filters?`, `any?`, `order_by?`, `limit?`, `offset?`, `select?` | `{collection, count, documents}` |
 | `aggregate` | `collection`, `op`, `filters?`, `any?`, `field?` | `{collection, op, results}` |
+| `document_delete` | `collection`, `id`, `force?` (hard delete; soft is the default) | `{ok, collection, id}` |
+| `document_restore` | `collection`, `id` | `{ok, collection, id, document}` |
+| `document_restore_available` | `collection?` (omitted = every collection) | retention records |
+| `documents_delete_queue` | `collection?` (omitted = every collection) | records due for sweep |
+| `sweep` | - | `{purged: count}` (admin profile) |
 | `compact` | `collection?` | `{ok, job_id}` |
 | `create_index` | `collection`, `field`, `kind`, `dim?`, `metric?` | `{ok, collection, field, kind}` |
 | `find_near` | `collection`, `field`, `vector`, `k?` | `{collection, field, count, hits}` |
