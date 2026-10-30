@@ -115,12 +115,15 @@ impl Profile {
             | "job_list"
             | "job_get"
             | "watch_create"
-            | "watch_delete" => true,
+            | "watch_delete"
+            | "document_restore_available"
+            | "documents_delete_queue" => true,
             "document_put" | "document_patch" | "document_delete" | "document_batch"
+            | "document_restore"
             | "index_create" | "schema_set" | "schema_clear" => {
                 matches!(self, Self::Data | Self::Sync | Self::Admin)
             }
-            "job_cancel" | "compact" | "vacuum" | "flush" | "documents_delete_where" => {
+            "job_cancel" | "compact" | "vacuum" | "flush" | "documents_delete_where" | "sweep" => {
                 matches!(self, Self::Admin)
             }
             "sync_start" | "sync_stop" | "sync_status" | "sync_peers" | "sync_versions" => {
@@ -804,7 +807,20 @@ impl Server {
             }),
             json!({
                 "name": "document_delete",
-                "description": "Delete one document by collection and id.",
+                "description": "Delete one document by collection and id. Deletes are soft by default (restoreable until the sweeper purges them); set `force` to purge immediately (requires --allow-destructive).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" },
+                        "id": { "type": "string" },
+                        "force": { "type": "boolean" }
+                    },
+                    "required": ["collection", "id"]
+                }
+            }),
+            json!({
+                "name": "document_restore",
+                "description": "Restore a soft-deleted document from its retention record (fresh version; consumes the record).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -812,6 +828,35 @@ impl Server {
                         "id": { "type": "string" }
                     },
                     "required": ["collection", "id"]
+                }
+            }),
+            json!({
+                "name": "document_restore_available",
+                "description": "List restoreable soft-deleted documents as retention records; empty `collection` lists every collection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" }
+                    }
+                }
+            }),
+            json!({
+                "name": "documents_delete_queue",
+                "description": "List soft-deleted documents due for sweeper purge; empty `collection` lists every collection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "collection": { "type": "string" }
+                    }
+                }
+            }),
+            json!({
+                "name": "sweep",
+                "description": "Run one retention sweep pass now; returns the number of expired records purged.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
                 }
             }),
             json!({
@@ -1250,6 +1295,10 @@ impl Server {
                 | "document_patch"
                 | "document_delete"
                 | "document_batch"
+                | "document_restore"
+                | "document_restore_available"
+                | "documents_delete_queue"
+                | "sweep"
                 | "query"
                 | "aggregate"
                 | "explain"
@@ -1300,6 +1349,10 @@ impl Server {
             "document_patch" => self.tool_patch(&args),
             "document_delete" => self.tool_delete(&args),
             "document_batch" => self.tool_batch(&args),
+            "document_restore" => self.tool_restore(&args),
+            "document_restore_available" => self.tool_restore_available(&args),
+            "documents_delete_queue" => self.tool_delete_queue(&args),
+            "sweep" => self.tool_sweep(),
             "query" => self.tool_query(&args),
             "aggregate" => self.tool_aggregate(&args),
             "explain" => self.tool_explain(&args),
@@ -1365,6 +1418,45 @@ impl Server {
         Ok(json!({ "collection": collection, "id": id, "exists": exists }))
     }
 
+    fn tool_restore(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = required_str(args, "collection")?;
+        self.ensure_collection(collection)?;
+        let id = required_str(args, "id")?;
+        self.db.restore(collection, id)?;
+        match self.db.get(collection, id)? {
+            Some(doc) => Ok(json!({
+                "ok": true,
+                "collection": collection,
+                "id": id,
+                "document": doc.to_json_with_id(id)
+            })),
+            None => bail!("restore: {collection}/{id} missing after restore"),
+        }
+    }
+
+    fn tool_restore_available(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = opt_str(args, "collection")?.map(str::to_string);
+        if let Some(collection) = &collection {
+            self.ensure_collection(collection)?;
+        }
+        let rows = self.db.restore_available(collection.as_deref())?;
+        Ok(json!({ "records": rows }))
+    }
+
+    fn tool_delete_queue(&self, args: &JsonValue) -> Result<JsonValue> {
+        let collection = opt_str(args, "collection")?.map(str::to_string);
+        if let Some(collection) = &collection {
+            self.ensure_collection(collection)?;
+        }
+        let rows = self.db.delete_queue(collection.as_deref())?;
+        Ok(json!({ "records": rows }))
+    }
+
+    fn tool_sweep(&self) -> Result<JsonValue> {
+        let purged = self.db.sweep_now()?;
+        Ok(json!({ "purged": purged }))
+    }
+
     fn tool_put(&self, args: &JsonValue) -> Result<JsonValue> {
         let collection = required_str(args, "collection")?;
         self.ensure_collection(collection)?;
@@ -1394,7 +1486,15 @@ impl Server {
         let collection = required_str(args, "collection")?;
         self.ensure_collection(collection)?;
         let id = required_str(args, "id")?;
-        let stored = self.db.delete(collection, id)?;
+        let force = args.get("force").and_then(JsonValue::as_bool).unwrap_or(false);
+        if force && !self.config.allow_destructive {
+            bail!("force delete requires --allow-destructive");
+        }
+        let stored = if force {
+            self.db.delete_force(collection, id)?
+        } else {
+            self.db.delete(collection, id)?
+        };
         Ok(json!({ "ok": true, "collection": collection, "id": stored }))
     }
 
@@ -1436,9 +1536,24 @@ impl Server {
                 }
                 "delete" => {
                     let doc_id = required_str(mutation, "id")?.to_string();
-                    batch.push(BatchMutation::Delete {
-                        collection: collection.to_string(),
-                        doc_id,
+                    let force = mutation
+                        .get("force")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false);
+                    if force && !self.config.allow_destructive {
+                        bail!("force delete requires --allow-destructive");
+                    }
+                    batch.push(if force {
+                        BatchMutation::Delete {
+                            collection: collection.to_string(),
+                            doc_id,
+                        }
+                    } else {
+                        // Soft by default; `Delete` is the legacy hard variant.
+                        BatchMutation::SoftDelete {
+                            collection: collection.to_string(),
+                            doc_id,
+                        }
                     });
                 }
                 other => bail!("`op` must be put, patch, or delete, got `{other}`"),
@@ -2250,6 +2365,11 @@ impl Server {
             limit: opt_usize(args, "limit", 100)?.min(self.config.max_query_rows),
             via_edge: opt_str(args, "via_edge")?.map(str::to_string),
             weight_field: opt_str(args, "weight_field")?.map(str::to_string),
+            node_match: None,
+            edge_type: None,
+            edge_match: None,
+            include_path: false,
+            include_via: false,
         };
         let hits = self.db.find_paths(collection, id, &spec)?;
         let hits: Vec<JsonValue> = hits
@@ -3968,6 +4088,78 @@ mod tests {
 
         let fixed = jobs.create("flush", false);
         assert!(jobs.cancel(&fixed).is_err());
+    }
+
+    #[test]
+    fn soft_delete_restore_and_sweep_roundtrip() {
+        let (server, _dir) = temp_server("softdel", ServerConfig::default());
+        initialize(&server);
+        let put = request(
+            &server,
+            1,
+            "tools/call",
+            json!({ "name": "put", "arguments": { "collection": "notes", "id": "n9", "doc": { "n": 7 } } }),
+        );
+        assert!(put["result"].get("isError").is_none(), "{put}");
+
+        let del = request(
+            &server,
+            2,
+            "tools/call",
+            json!({ "name": "document_delete", "arguments": { "collection": "notes", "id": "n9" } }),
+        );
+        assert!(del["result"].get("isError").is_none(), "{del}");
+        let listed = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "document_restore_available", "arguments": { "collection": "notes" } }),
+        );
+        assert!(listed["result"].get("isError").is_none(), "{listed}");
+        let records = tool_json(&listed)["records"].as_array().cloned().unwrap_or_default();
+        assert!(records.iter().any(|r| r["id"] == "n9"), "{listed}");
+
+        // force delete is refused without --allow-destructive; the record stays intact
+        let forced = request(
+            &server,
+            4,
+            "tools/call",
+            json!({ "name": "document_delete", "arguments": { "collection": "notes", "id": "n9", "force": true } }),
+        );
+        assert_eq!(forced["result"]["isError"], json!(true), "{forced}");
+        let still = request(
+            &server,
+            5,
+            "tools/call",
+            json!({ "name": "document_restore_available", "arguments": {} }),
+        );
+        let all = tool_json(&still)["records"].as_array().cloned().unwrap_or_default();
+        assert!(all.iter().any(|r| r["id"] == "n9"), "{still}");
+
+        let restore = request(
+            &server,
+            6,
+            "tools/call",
+            json!({ "name": "document_restore", "arguments": { "collection": "notes", "id": "n9" } }),
+        );
+        assert!(restore["result"].get("isError").is_none(), "{restore}");
+        assert_eq!(tool_json(&restore)["document"]["n"], 7);
+
+        // sweep lives in the admin profile
+        let admin_config = ServerConfig {
+            profile: Profile::Admin,
+            ..ServerConfig::default()
+        };
+        let (admin, _adir) = temp_server("softdel-admin", admin_config);
+        initialize(&admin);
+        let sweep = request(
+            &admin,
+            1,
+            "tools/call",
+            json!({ "name": "sweep", "arguments": {} }),
+        );
+        assert!(sweep["result"].get("isError").is_none(), "{sweep}");
+        assert_eq!(tool_json(&sweep)["purged"], 0);
     }
 
     #[test]
